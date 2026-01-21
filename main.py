@@ -224,6 +224,56 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(f"❌ Не смог обработать файл: {type(e).__name__}: {e}")
 
+@dp.message(LoginFlow.waiting_fio)
+async def login_get_fio(message: types.Message, state: FSMContext):
+    fio = normalize_fio(message.text or "")
+    if len(fio) < 5:
+        await message.answer("ФИО слишком короткое. Введи полностью (пример: Иванов Иван Иванович).")
+        return
+
+    merch = get_merch_by_fio(fio)
+    if not merch:
+        await message.answer("❌ Не нашёл вас в списке. Проверь ФИО и попробуй ещё раз.")
+        return
+
+    await state.update_data(fio=fio)
+    await state.set_state(LoginFlow.waiting_last4)
+    await message.answer("Теперь введи последние 4 цифры номера телефона (только 4 цифры).")
+
+
+@dp.message(LoginFlow.waiting_last4)
+async def login_get_last4(message: types.Message, state: FSMContext):
+    last4 = (message.text or "").strip()
+    if not re.fullmatch(r"\d{4}", last4):
+        await message.answer("Нужно ровно 4 цифры. Пример: 1234")
+        return
+
+    data = await state.get_data()
+    fio = data.get("fio")
+    merch = get_merch_by_fio(fio)
+
+    if not merch:
+        await state.clear()
+        await message.answer("❌ Ошибка: запись не найдена. Начни заново: /start")
+        return
+
+    expected = merch["pass_hash"]
+    if hash_last4(last4) != expected:
+        await message.answer("❌ Неверные 4 цифры. Попробуй ещё раз.")
+        return
+
+    # защита: если telegram_id уже привязан к другому — не даём привязать
+    if merch["telegram_id"] is not None and int(merch["telegram_id"]) != message.from_user.id:
+        await state.clear()
+        await message.answer("⛔ Этот аккаунт уже привязан к другому Telegram. Обратитесь к администратору.")
+        return
+
+    bind_merch_tg_id(merch["id"], message.from_user.id)
+    await state.clear()
+    await message.answer(f"✅ Успешный вход. Вы: {merch['fio']}")
+    await message.answer("Главное меню появится дальше 🙂")
+
+
 
 @dp.message(UploadMerchants.waiting_file)
 async def waiting_file_hint(message: types.Message):
