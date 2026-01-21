@@ -81,6 +81,11 @@ def hash_last4(last4: str) -> str:
 class UploadMerchants(StatesGroup):
     waiting_file = State()
 
+class LoginFlow(StatesGroup):
+    waiting_fio = State()
+    waiting_last4 = State()
+
+
 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
