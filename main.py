@@ -137,6 +137,15 @@ async def ping_db(message: types.Message):
 async def my_id(message: types.Message):
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
 
+@dp.message(Command("unbind"))
+async def unbind_user(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    await message.answer("Отправь ФИО мерча, которому нужно сбросить привязку telegram_id.")
+
+
 
 @dp.message(Command("upload_merchants"))
 async def upload_merchants_cmd(message: types.Message, state: FSMContext):
