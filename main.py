@@ -62,6 +62,11 @@ async def ping_db(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка БД: {type(e).__name__}")
 
+@dp.message(Command("myid"))
+async def my_id(message: types.Message):
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
 
 # ---------- HTTP SERVER (для Render) ----------
 
