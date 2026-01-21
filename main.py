@@ -68,9 +68,11 @@ def is_admin(user_id: int) -> bool:
 
 
 def normalize_fio(s: str) -> str:
-    s = s.strip()
+    s = s.strip().lower()
+    s = s.replace("ё", "е")
     s = re.sub(r"\s+", " ", s)
     return s
+
 
 
 def hash_last4(last4: str) -> str:
