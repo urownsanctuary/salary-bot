@@ -77,6 +77,29 @@ def hash_last4(last4: str) -> str:
     s = (last4.strip() + SECRET_SALT).encode("utf-8")
     return hashlib.sha256(s).hexdigest()
 
+def get_merch_by_tg_id(tg_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, fio FROM merchants WHERE telegram_id = :tg_id"),
+            {"tg_id": tg_id},
+        ).mappings().first()
+    return row
+
+def get_merch_by_fio(fio: str):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, fio, pass_hash, telegram_id FROM merchants WHERE fio = :fio"),
+            {"fio": fio},
+        ).mappings().first()
+    return row
+
+def bind_merch_tg_id(merch_id: int, tg_id: int):
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE merchants SET telegram_id = :tg_id WHERE id = :id"),
+            {"tg_id": tg_id, "id": merch_id},
+        )
+
 
 class UploadMerchants(StatesGroup):
     waiting_file = State()
