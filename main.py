@@ -308,6 +308,71 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
 
         text_data = buf.read().decode("utf-8-sig", errors="replace")
 
+        reader = csv.reader(StringIO(text_data), delimiter=",")
+
+        added, updated, bad_rows = 0, 0, 0
+
+        with engine.begin() as conn:
+            for row in reader:
+                if len(row) < 2:
+                    bad_rows += 1
+                    continue
+
+                fio_raw = row[0]
+                phone_raw = row[1]
+
+                fio_disp = fio_display(fio_raw)
+                fio_n = fio_norm(fio_raw)
+
+                last4 = extract_last4_from_phone(phone_raw)
+
+                if not fio_n or not re.fullmatch(r"\d{4}", last4):
+                    bad_rows += 1
+                    continue
+
+                ph = hash_last4(last4)
+
+                res = conn.execute(text("""
+                    INSERT INTO merchants (fio, fio_norm, pass_hash)
+                    VALUES (:fio, :fio_norm, :pass_hash)
+                    ON CONFLICT (fio_norm) DO UPDATE
+                        SET fio = EXCLUDED.fio,
+                            pass_hash = EXCLUDED.pass_hash
+                    RETURNING xmax;
+                """), {
+                    "fio": fio_disp,
+                    "fio_norm": fio_n,
+                    "pass_hash": ph
+                })
+
+                xmax = res.scalar()
+                if xmax == 0:
+                    added += 1
+                else:
+                    updated += 1
+
+        await state.clear()
+        await message.answer(
+            f"✅ Готово.\n"
+            f"Добавлено: {added}\n"
+            f"Обновлено: {updated}\n"
+            f"Пропущено (ошибочные строки): {bad_rows}"
+        )
+
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"❌ Ошибка обработки файла: {e}")
+
+
+    doc = message.document
+    try:
+        file = await bot.get_file(doc.file_id)
+        buf = BytesIO()
+        await bot.download_file(file.file_path, destination=buf)
+        buf.seek(0)
+
+        text_data = buf.read().decode("utf-8-sig", errors="replace")
+
         sample = text_data[:2048]
         dialect = csv.Sniffer().sniff(sample, delimiters=";,")
         reader = csv.DictReader(StringIO(text_data), dialect=dialect)
