@@ -111,8 +111,16 @@ class LoginFlow(StatesGroup):
 
 
 @dp.message(Command("start"))
-async def start_handler(message: types.Message):
-    await message.answer("Привет! Я бот для расчёта зарплаты. ✅")
+async def start_handler(message: types.Message, state: FSMContext):
+    merch = get_merch_by_tg_id(message.from_user.id)
+    if merch:
+        await message.answer(f"✅ Вы уже авторизованы как: {merch['fio']}")
+        await message.answer("Главное меню появится позже. Пока всё ок 🙂")
+        return
+
+    await state.set_state(LoginFlow.waiting_fio)
+    await message.answer("Привет! Для входа введи ФИО полностью (как в списке).")
+
 
 
 @dp.message(Command("pingdb"))
