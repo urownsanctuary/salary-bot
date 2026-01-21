@@ -10,6 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -28,6 +29,7 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+
 def parse_admin_ids(raw: str) -> set[int]:
     ids = set()
     for part in raw.split(","):
@@ -35,6 +37,7 @@ def parse_admin_ids(raw: str) -> set[int]:
         if part.isdigit():
             ids.add(int(part))
     return ids
+
 
 ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
 
@@ -44,17 +47,74 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# ----------------- UI (кнопки) -----------------
+LOGIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Отмена"), KeyboardButton(text="Заново")],
+    ],
+    resize_keyboard=True
+)
+
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Заполнить сверку")],
+    ],
+    resize_keyboard=True
+)
+
+
+# ----------------- Helpers -----------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def fio_display(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def fio_norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("ё", "е")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def extract_last4_from_phone(phone: str) -> str:
+    """
+    Берём любые форматы телефона:
+    8-920-888-88-88, +7 (920) 888-88-88, 89208888888 и т.п.
+    Вытаскиваем только цифры и берём последние 4.
+    """
+    digits = re.sub(r"\D+", "", phone or "")
+    if len(digits) < 4:
+        return ""
+    return digits[-4:]
+
+
+def hash_last4(last4: str) -> str:
+    s = (last4.strip() + SECRET_SALT).encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
+
+
 def ensure_tables():
     with engine.begin() as conn:
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS merchants (
             id SERIAL PRIMARY KEY,
-            fio TEXT NOT NULL UNIQUE,
+            fio TEXT NOT NULL,
+            fio_norm TEXT,
             pass_hash TEXT NOT NULL,
             telegram_id BIGINT UNIQUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """))
+
+        # миграции на случай, если таблица уже была создана старой версией
+        conn.execute(text("ALTER TABLE merchants ADD COLUMN IF NOT EXISTS fio_norm TEXT;"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS merchants_fio_norm_uq ON merchants(fio_norm);"))
+
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS admins (
             id SERIAL PRIMARY KEY,
@@ -62,22 +122,13 @@ def ensure_tables():
         );
         """))
 
+        # попытка заполнить fio_norm для старых строк (минимально)
+        conn.execute(text("""
+        UPDATE merchants
+        SET fio_norm = lower(replace(replace(fio, 'Ё', 'Е'), 'ё', 'е'))
+        WHERE fio_norm IS NULL OR fio_norm = '';
+        """))
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def normalize_fio(s: str) -> str:
-    s = s.strip().lower()
-    s = s.replace("ё", "е")
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-
-def hash_last4(last4: str) -> str:
-    s = (last4.strip() + SECRET_SALT).encode("utf-8")
-    return hashlib.sha256(s).hexdigest()
 
 def get_merch_by_tg_id(tg_id: int):
     with engine.connect() as conn:
@@ -87,13 +138,16 @@ def get_merch_by_tg_id(tg_id: int):
         ).mappings().first()
     return row
 
+
 def get_merch_by_fio(fio: str):
+    fn = fio_norm(fio)
     with engine.connect() as conn:
         row = conn.execute(
-            text("SELECT id, fio, pass_hash, telegram_id FROM merchants WHERE fio = :fio"),
-            {"fio": fio},
+            text("SELECT id, fio, pass_hash, telegram_id FROM merchants WHERE fio_norm = :fio_norm"),
+            {"fio_norm": fn},
         ).mappings().first()
     return row
+
 
 def bind_merch_tg_id(merch_id: int, tg_id: int):
     with engine.begin() as conn:
@@ -103,30 +157,43 @@ def bind_merch_tg_id(merch_id: int, tg_id: int):
         )
 
 
+# ----------------- States -----------------
 class UploadMerchants(StatesGroup):
     waiting_file = State()
+
 
 class LoginFlow(StatesGroup):
     waiting_fio = State()
     waiting_last4 = State()
 
 
+# ----------------- Common “cancel/restart” -----------------
+@dp.message(F.text.in_({"Отмена", "Заново"}))
+async def cancel_or_restart(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.text == "Отмена":
+        await message.answer("Ок, отменил. Напиши /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await message.answer("Начнём заново. Напиши /start", reply_markup=ReplyKeyboardRemove())
 
+
+# ----------------- Basic commands -----------------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message, state: FSMContext):
     merch = get_merch_by_tg_id(message.from_user.id)
     if merch:
-        await message.answer(f"✅ Вы уже авторизованы как: {merch['fio']}")
-        await message.answer("Главное меню появится позже. Пока всё ок 🙂")
+        await state.clear()
+        await message.answer(f"✅ Вы уже авторизованы как: {merch['fio']}", reply_markup=MAIN_KB)
         return
 
     await state.set_state(LoginFlow.waiting_fio)
-    await message.answer("Привет! 👋\n"
-"Для входа введи ФИО полностью.\n\n"
-"Пример:\n"
-"Иванов Иван Иванович"
-)
-
+    await message.answer(
+        "Привет! 👋\n"
+        "Для входа введи ФИО полностью.\n\n"
+        "Пример:\n"
+        "Иванов Иван Иванович",
+        reply_markup=LOGIN_KB
+    )
 
 
 @dp.message(Command("pingdb"))
@@ -143,16 +210,70 @@ async def ping_db(message: types.Message):
 async def my_id(message: types.Message):
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
 
-@dp.message(Command("unbind"))
-async def unbind_user(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Эта команда только для администратора.")
+
+# ----------------- Login flow -----------------
+@dp.message(LoginFlow.waiting_fio)
+async def login_get_fio(message: types.Message, state: FSMContext):
+    fio_in = fio_display(message.text or "")
+    if len(fio_in) < 5:
+        await message.answer("ФИО слишком короткое. Введи полностью (пример: Иванов Иван Иванович).", reply_markup=LOGIN_KB)
         return
 
-    await message.answer("Отправь ФИО мерча, которому нужно сбросить привязку telegram_id.")
+    merch = get_merch_by_fio(fio_in)
+    if not merch:
+        await message.answer(
+            "❌ Не получилось найти ФИО.\n"
+            "Проверь написание или обратись к территориальному управляющему.",
+            reply_markup=LOGIN_KB
+        )
+        return
+
+    await state.update_data(fio=fio_in)
+    await state.set_state(LoginFlow.waiting_last4)
+    await message.answer("Теперь введи последние 4 цифры номера телефона (только 4 цифры).", reply_markup=LOGIN_KB)
 
 
+@dp.message(LoginFlow.waiting_last4)
+async def login_get_last4(message: types.Message, state: FSMContext):
+    last4 = (message.text or "").strip()
+    if not re.fullmatch(r"\d{4}", last4):
+        await message.answer("Нужно ровно 4 цифры. Пример: 6384", reply_markup=LOGIN_KB)
+        return
 
+    data = await state.get_data()
+    fio_in = data.get("fio", "")
+    merch = get_merch_by_fio(fio_in)
+
+    if not merch:
+        await state.clear()
+        await message.answer("❌ Ошибка: запись не найдена. Начни заново: /start", reply_markup=ReplyKeyboardRemove())
+        return
+
+    if hash_last4(last4) != merch["pass_hash"]:
+        await message.answer("❌ Неверные 4 цифры. Попробуй ещё раз.", reply_markup=LOGIN_KB)
+        return
+
+    if merch["telegram_id"] is not None and int(merch["telegram_id"]) != message.from_user.id:
+        await state.clear()
+        await message.answer("⛔ Этот аккаунт уже привязан к другому Telegram. Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    bind_merch_tg_id(merch["id"], message.from_user.id)
+    await state.clear()
+    await message.answer(f"✅ Успешный вход. Вы: {merch['fio']}", reply_markup=MAIN_KB)
+
+
+# ----------------- Merch menu (пока заглушка) -----------------
+@dp.message(F.text == "Заполнить сверку")
+async def fill_reconcile_stub(message: types.Message):
+    merch = get_merch_by_tg_id(message.from_user.id)
+    if not merch:
+        await message.answer("Сначала нужно войти: /start", reply_markup=ReplyKeyboardRemove())
+        return
+    await message.answer("Ок! Дальше здесь будет ввод точки и календарь. (Следующий этап)", reply_markup=MAIN_KB)
+
+
+# ----------------- Admin: upload merchants -----------------
 @dp.message(Command("upload_merchants"))
 async def upload_merchants_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -162,11 +283,13 @@ async def upload_merchants_cmd(message: types.Message, state: FSMContext):
     await state.set_state(UploadMerchants.waiting_file)
     await message.answer(
         "Ок. Пришли CSV-файл мерчендайзеров документом.\n\n"
-        "Формат CSV:\n"
-        "fio,last4\n"
-        "Иванов Иван Иванович,1234\n"
-        "Петров Пётр Сергеевич,5678\n\n"
-        "Можно разделитель запятая или точка с запятой."
+        "Поддерживаются форматы:\n"
+        "1) fio,phone\n"
+        "   РОМАШИНА ЕКАТЕРИНА ЮРЬЕВНА,8-920-888-88-88\n\n"
+        "2) fio,last4\n"
+        "   Ромашина Екатерина Юрьевна,6384\n\n"
+        "Разделитель: запятая или точка с запятой.\n"
+        "Телефон может быть с дефисами/скобками/пробелами — мы возьмём последние 4 цифры."
     )
 
 
@@ -185,17 +308,39 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
 
         text_data = buf.read().decode("utf-8-sig", errors="replace")
 
-        # Определяем разделитель
         sample = text_data[:2048]
         dialect = csv.Sniffer().sniff(sample, delimiters=";,")
         reader = csv.DictReader(StringIO(text_data), dialect=dialect)
 
-        required = {"fio", "last4"}
         if not reader.fieldnames:
             raise ValueError("CSV без заголовков")
+
         fields = {f.strip().lower() for f in reader.fieldnames}
-        if not required.issubset(fields):
-            raise ValueError("Нужны колонки: fio,last4")
+
+        # варианты заголовков
+        fio_field = None
+        for cand in ["fio", "фио", "full_name", "name"]:
+            if cand in fields:
+                fio_field = cand
+                break
+
+        phone_field = None
+        for cand in ["phone", "телефон", "phone_number", "mobile"]:
+            if cand in fields:
+                phone_field = cand
+                break
+
+        last4_field = None
+        for cand in ["last4", "pass", "password", "last_4"]:
+            if cand in fields:
+                last4_field = cand
+                break
+
+        if fio_field is None:
+            raise ValueError("Не нашёл колонку fio/ФИО")
+
+        if phone_field is None and last4_field is None:
+            raise ValueError("Нужна колонка phone/телефон или last4")
 
         added = 0
         updated = 0
@@ -203,24 +348,49 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
 
         with engine.begin() as conn:
             for row in reader:
-                fio = normalize_fio(str(row.get("fio", "") or row.get("FIO", "") or row.get("ФИО", "")).strip())
-                last4 = str(row.get("last4", "") or row.get("LAST4", "")).strip()
+                # достаём fio
+                fio_raw = ""
+                for k, v in row.items():
+                    if (k or "").strip().lower() == fio_field:
+                        fio_raw = str(v or "")
+                        break
 
-                if not fio or not re.fullmatch(r"\d{4}", last4):
+                fio_disp = fio_display(fio_raw)
+                fio_n = fio_norm(fio_raw)
+
+                # достаём last4
+                last4 = ""
+                if last4_field is not None:
+                    for k, v in row.items():
+                        if (k or "").strip().lower() == last4_field:
+                            last4 = str(v or "").strip()
+                            break
+
+                if not re.fullmatch(r"\d{4}", last4):
+                    # пробуем извлечь из телефона
+                    if phone_field is not None:
+                        phone_raw = ""
+                        for k, v in row.items():
+                            if (k or "").strip().lower() == phone_field:
+                                phone_raw = str(v or "")
+                                break
+                        last4 = extract_last4_from_phone(phone_raw)
+
+                if not fio_n or not re.fullmatch(r"\d{4}", last4):
                     bad_rows += 1
                     continue
 
                 ph = hash_last4(last4)
 
-                # upsert
                 res = conn.execute(text("""
-                    INSERT INTO merchants (fio, pass_hash)
-                    VALUES (:fio, :pass_hash)
-                    ON CONFLICT (fio) DO UPDATE SET pass_hash = EXCLUDED.pass_hash
+                    INSERT INTO merchants (fio, fio_norm, pass_hash)
+                    VALUES (:fio, :fio_norm, :pass_hash)
+                    ON CONFLICT (fio_norm) DO UPDATE
+                        SET fio = EXCLUDED.fio,
+                            pass_hash = EXCLUDED.pass_hash
                     RETURNING xmax;
-                """), {"fio": fio, "pass_hash": ph})
+                """), {"fio": fio_disp, "fio_norm": fio_n, "pass_hash": ph})
 
-                # xmax == 0 примерно означает insert, иначе update (хак Postgres)
                 xmax = res.scalar()
                 if xmax == 0:
                     added += 1
@@ -239,58 +409,6 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(f"❌ Не смог обработать файл: {type(e).__name__}: {e}")
 
-@dp.message(LoginFlow.waiting_fio)
-async def login_get_fio(message: types.Message, state: FSMContext):
-    fio = normalize_fio(message.text or "")
-    if len(fio) < 2:
-        await message.answer("ФИО слишком короткое. Введи полностью (пример: Иванов Иван Иванович).")
-        return
-
-    merch = get_merch_by_fio(fio)
-    if not merch:
-        await message.answer("❌ Не получилось найти ФИО.\n"
-"Проверь написание или обратись к территориальному управляющему."
-)
-        return
-
-    await state.update_data(fio=fio)
-    await state.set_state(LoginFlow.waiting_last4)
-    await message.answer("Теперь введи последние 4 цифры номера телефона (только 4 цифры).")
-
-
-@dp.message(LoginFlow.waiting_last4)
-async def login_get_last4(message: types.Message, state: FSMContext):
-    last4 = (message.text or "").strip()
-    if not re.fullmatch(r"\d{4}", last4):
-        await message.answer("Нужно ровно 4 цифры. Пример: 1234")
-        return
-
-    data = await state.get_data()
-    fio = data.get("fio")
-    merch = get_merch_by_fio(fio)
-
-    if not merch:
-        await state.clear()
-        await message.answer("❌ Ошибка: запись не найдена. Начни заново: /start")
-        return
-
-    expected = merch["pass_hash"]
-    if hash_last4(last4) != expected:
-        await message.answer("❌ Неверные 4 цифры. Попробуй ещё раз.")
-        return
-
-    # защита: если telegram_id уже привязан к другому — не даём привязать
-    if merch["telegram_id"] is not None and int(merch["telegram_id"]) != message.from_user.id:
-        await state.clear()
-        await message.answer("⛔ Этот аккаунт уже привязан к другому Telegram. Обратитесь к администратору.")
-        return
-
-    bind_merch_tg_id(merch["id"], message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ Успешный вход. Вы: {merch['fio']}")
-    await message.answer("Главное меню появится дальше 🙂")
-
-
 
 @dp.message(UploadMerchants.waiting_file)
 async def waiting_file_hint(message: types.Message):
@@ -307,7 +425,7 @@ async def merchants_count(message: types.Message):
     await message.answer(f"Сейчас мерчендайзеров в базе: {cnt}")
 
 
-# ---------- HTTP SERVER (для Render) ----------
+# ----------------- HTTP server (для Render Web Service) -----------------
 async def healthcheck(request):
     return web.Response(text="OK")
 
@@ -315,13 +433,14 @@ async def healthcheck(request):
 async def start_http_server():
     app = web.Application()
     app.router.add_get("/", healthcheck)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
 
-# ---------- MAIN ----------
+# ----------------- main -----------------
 async def main():
     ensure_tables()
     await asyncio.gather(
