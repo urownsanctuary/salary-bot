@@ -121,7 +121,11 @@ async def start_handler(message: types.Message, state: FSMContext):
         return
 
     await state.set_state(LoginFlow.waiting_fio)
-    await message.answer("Привет! Для входа введи ФИО полностью (как в списке).")
+    await message.answer("Привет! 👋\n"
+"Для входа введи ФИО полностью.\n\n"
+"Пример:\n"
+"Иванов Иван Иванович"
+)
 
 
 
@@ -238,13 +242,15 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
 @dp.message(LoginFlow.waiting_fio)
 async def login_get_fio(message: types.Message, state: FSMContext):
     fio = normalize_fio(message.text or "")
-    if len(fio) < 5:
+    if len(fio) < 2:
         await message.answer("ФИО слишком короткое. Введи полностью (пример: Иванов Иван Иванович).")
         return
 
     merch = get_merch_by_fio(fio)
     if not merch:
-        await message.answer("❌ Не нашёл вас в списке. Проверь ФИО и попробуй ещё раз.")
+        await message.answer("❌ Не получилось найти ФИО.\n"
+"Проверь написание или обратись к территориальному управляющему."
+)
         return
 
     await state.update_data(fio=fio)
