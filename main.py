@@ -2,8 +2,9 @@ import os
 import asyncio
 import hashlib
 import re
-from io import BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime, date, timedelta
+import csv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -22,12 +23,13 @@ from aiohttp import web
 import openpyxl
 
 
+# ----------------- ENV -----------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")  # "123,456"
 SECRET_SALT = os.getenv("SECRET_SALT", "CHANGE_ME_SALT")
 
 if not BOT_TOKEN:
@@ -82,10 +84,18 @@ def fio_display(s: str) -> str:
 
 
 def fio_norm(s: str) -> str:
+    """
+    Устойчивая нормализация ФИО:
+    - lower
+    - ё->е
+    - unicode-пробелы -> пробел
+    - убрать всё кроме букв и пробелов
+    - схлопнуть пробелы
+    """
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
-    s = re.sub(r"[\u00A0\u2000-\u200B\u202F\u205F\u3000]", " ", s)
-    s = re.sub(r"[^а-яa-z\s]", " ", s)
+    s = re.sub(r"[\u00A0\u2000-\u200B\u202F\u205F\u3000]", " ", s)  # странные пробелы
+    s = re.sub(r"[^а-яa-z\s]", " ", s)  # убрать знаки/цифры
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -131,6 +141,7 @@ def month_title(y: int, m: int) -> str:
     return f"{names[m-1]} {y}"
 
 
+# ----------------- DB schema -----------------
 def ensure_tables():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -170,21 +181,20 @@ def ensure_tables():
         );
         """))
 
-        # Примечания/возмещения по точке за месяц
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS reimbursements (
             id SERIAL PRIMARY KEY,
             merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             point_code TEXT NOT NULL,
             month_key DATE NOT NULL, -- 1-е число месяца
-            amount INTEGER NOT NULL, -- можно отрицательное
+            amount INTEGER NOT NULL, -- может быть отрицательное
             note TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS reimb_idx ON reimbursements(merchant_id, point_code, month_key);"))
 
-        # best-effort заполнение fio_norm для старых строк
+        # best-effort заполнение fio_norm
         conn.execute(text("""
         UPDATE merchants
         SET fio_norm = lower(replace(replace(fio, 'Ё', 'Е'), 'ё', 'е'))
@@ -192,6 +202,7 @@ def ensure_tables():
         """))
 
 
+# ----------------- DB queries -----------------
 def get_merch_by_tg_id(tg_id: int):
     with engine.connect() as conn:
         row = conn.execute(
@@ -217,6 +228,34 @@ def bind_merch_tg_id(merch_id: int, tg_id: int):
             text("UPDATE merchants SET telegram_id = :tg_id WHERE id = :id"),
             {"tg_id": tg_id, "id": merch_id},
         )
+
+
+def upsert_merchant(conn, fio_raw: str, phone_raw: str) -> tuple[bool, bool]:
+    fio_raw = fio_raw or ""
+    phone_raw = phone_raw or ""
+
+    fio_disp = fio_display(fio_raw)
+    fio_n = fio_norm(fio_raw)
+    last4 = extract_last4_from_phone(phone_raw)
+
+    # минимум "фамилия имя"
+    if not fio_n or len(fio_n.split(" ")) < 2 or not re.fullmatch(r"\d{4}", last4):
+        return (False, False)
+
+    ph = hash_last4(last4)
+    res = conn.execute(text("""
+        INSERT INTO merchants (fio, fio_norm, pass_hash)
+        VALUES (:fio, :fio_norm, :pass_hash)
+        ON CONFLICT (fio_norm) DO UPDATE
+            SET fio = EXCLUDED.fio,
+                pass_hash = EXCLUDED.pass_hash
+        RETURNING xmax;
+    """), {"fio": fio_disp, "fio_norm": fio_n, "pass_hash": ph})
+
+    xmax = res.scalar()
+    if xmax == 0:
+        return (True, False)
+    return (False, True)
 
 
 def get_supply_map(point_code: str, y: int, m: int) -> dict[int, bool]:
@@ -276,7 +315,77 @@ def compute_month_total(merchant_id: int, point_code: str, y: int, m: int) -> in
     return total
 
 
+# ----------------- Excel parsing: supplies (your format) -----------------
+RU_MONTH = {
+    "янв": 1, "январ": 1,
+    "фев": 2, "феврал": 2,
+    "мар": 3, "март": 3,
+    "апр": 4, "апрел": 4,
+    "май": 5,
+    "июн": 6, "июнь": 6,
+    "июл": 7, "июль": 7,
+    "авг": 8, "август": 8,
+    "сен": 9, "сент": 9,
+    "окт": 10, "октябр": 10,
+    "ноя": 11, "ноябр": 11,
+    "дек": 12, "декабр": 12,
+}
+
+
+def parse_header_date(cell_value, default_year: int) -> date | None:
+    """
+    В шапке может быть:
+    - datetime/date объект
+    - строка вида '20.янв' / '20 янв' / '20.01' / '20.01.2026'
+    """
+    if cell_value is None:
+        return None
+
+    if isinstance(cell_value, datetime):
+        return cell_value.date()
+    if isinstance(cell_value, date):
+        return cell_value
+
+    s = str(cell_value).strip().lower()
+    s = s.replace(",", ".").replace("-", ".")
+    s = re.sub(r"\s+", " ", s)
+
+    # 20.янв
+    m = re.match(r"^(\d{1,2})[.\s](\D+)$", s)
+    if m:
+        day = int(m.group(1))
+        mon_raw = m.group(2).strip()
+        mon_raw = re.sub(r"[^а-я]", "", mon_raw)
+        mon = None
+        for k, v in RU_MONTH.items():
+            if mon_raw.startswith(k):
+                mon = v
+                break
+        if mon:
+            return date(default_year, mon, day)
+
+    # 20.01 or 20.1 or 20.01.2026
+    m2 = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$", s)
+    if m2:
+        day = int(m2.group(1))
+        mon = int(m2.group(2))
+        yr = m2.group(3)
+        year = default_year
+        if yr:
+            y = int(yr)
+            if y < 100:
+                y += 2000
+            year = y
+        return date(year, mon, day)
+
+    return None
+
+
 # ----------------- States -----------------
+class UploadMerchants(StatesGroup):
+    waiting_file = State()
+
+
 class UploadSupplies(StatesGroup):
     waiting_file = State()
 
@@ -326,6 +435,32 @@ async def start_handler(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(Command("myid"))
+async def my_id(message: types.Message):
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("pingdb"))
+async def ping_db(message: types.Message):
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1;"))
+        await message.answer("✅ База данных доступна.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка БД: {type(e).__name__}")
+
+
+@dp.message(Command("merchants_count"))
+async def merchants_count(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+    with engine.connect() as conn:
+        cnt = conn.execute(text("SELECT COUNT(*) FROM merchants;")).scalar()
+    await message.answer(f"Сейчас мерчендайзеров в базе: {cnt}")
+
+
+# ----------------- Login flow -----------------
 async def verify_login_last4(user_tg_id: int, fio_in: str, last4: str) -> tuple[bool, str]:
     merch = get_merch_by_fio(fio_in)
     if not merch:
@@ -343,6 +478,7 @@ async def verify_login_last4(user_tg_id: int, fio_in: str, last4: str) -> tuple[
 
 @dp.message(LoginFlow.waiting_fio)
 async def login_get_fio(message: types.Message, state: FSMContext):
+    # разрешаем ввод "ФИО, 1234"
     txt = (message.text or "").strip()
     prefilled_last4 = None
     if "," in txt:
@@ -391,6 +527,195 @@ async def login_get_last4(message: types.Message, state: FSMContext):
         await message.answer(msg, reply_markup=MAIN_KB)
     else:
         await message.answer(msg, reply_markup=LOGIN_KB)
+
+
+# ----------------- Admin: upload merchants (.xlsx) -----------------
+@dp.message(Command("upload_merchants"))
+async def upload_merchants_cmd(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    await state.set_state(UploadMerchants.waiting_file)
+    await message.answer(
+        "Ок. Пришли Excel .xlsx с 2 столбцами:\n"
+        "A: ФИО\n"
+        "B: Телефон\n\n"
+        "Телефон может быть в любом формате — бот сам возьмёт последние 4 цифры.",
+        reply_markup=CANCEL_KB
+    )
+
+
+@dp.message(UploadMerchants.waiting_file, F.document)
+async def handle_merchants_file(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    doc = message.document
+    try:
+        filename = (doc.file_name or "").lower()
+        if not filename.endswith(".xlsx"):
+            await message.answer("❌ Нужен файл .xlsx", reply_markup=ReplyKeyboardRemove())
+            await state.clear()
+            return
+
+        f = await bot.get_file(doc.file_id)
+        buf = BytesIO()
+        await bot.download_file(f.file_path, destination=buf)
+        raw = buf.getvalue()
+
+        wb = openpyxl.load_workbook(BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+
+        added = updated = bad_rows = 0
+        with engine.begin() as conn:
+            for r in ws.iter_rows(min_row=1, values_only=True):
+                if not r or len(r) < 2:
+                    continue
+                a = "" if r[0] is None else str(r[0])
+                b = "" if r[1] is None else str(r[1])
+                ins, upd = upsert_merchant(conn, a, b)
+                if ins:
+                    added += 1
+                elif upd:
+                    updated += 1
+                else:
+                    bad_rows += 1
+
+        await state.clear()
+        await message.answer(
+            f"✅ Готово.\nДобавлено: {added}\nОбновлено: {updated}\nПропущено (ошибочные строки): {bad_rows}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"❌ Ошибка обработки файла: {type(e).__name__}: {e}", reply_markup=ReplyKeyboardRemove())
+
+
+# ----------------- Admin: upload supplies (.xlsx your format) -----------------
+@dp.message(Command("upload_supplies"))
+async def upload_supplies_cmd(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    # /upload_supplies 2026
+    parts = (message.text or "").split()
+    y = datetime.utcnow().year
+    if len(parts) >= 2 and parts[1].isdigit():
+        y = int(parts[1])
+
+    await state.set_state(UploadSupplies.waiting_file)
+    await state.update_data(supplies_year=y)
+
+    await message.answer(
+        "Ок. Пришли Excel .xlsx с поставками (как в твоём формате):\n"
+        "- строки: точки\n"
+        "- в шапке: даты\n"
+        "- в ячейках: коробки\n\n"
+        f"Год для дат без года: {y}\n"
+        "Если нужен другой год: /upload_supplies 2027",
+        reply_markup=CANCEL_KB
+    )
+
+
+@dp.message(UploadSupplies.waiting_file, F.document)
+async def handle_supplies_file(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    doc = message.document
+    try:
+        filename = (doc.file_name or "").lower()
+        if not filename.endswith(".xlsx"):
+            await message.answer("❌ Нужен файл .xlsx", reply_markup=ReplyKeyboardRemove())
+            await state.clear()
+            return
+
+        data = await state.get_data()
+        default_year = int(data.get("supplies_year", datetime.utcnow().year))
+
+        f = await bot.get_file(doc.file_id)
+        buf = BytesIO()
+        await bot.download_file(f.file_path, destination=buf)
+        raw = buf.getvalue()
+
+        wb = openpyxl.load_workbook(BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.worksheets[0]
+
+        # header row
+        header = None
+        for r in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+            header = list(r)
+        if not header or len(header) < 3:
+            raise ValueError("Не смог прочитать шапку: ожидаю TT + (игнор) + даты")
+
+        # предполагаем:
+        # col0 = TT (код точки)
+        # col1 = помощник/ФИО (игнорируем)
+        # col2.. = даты
+        date_cols: dict[int, date] = {}
+        for idx in range(2, len(header)):
+            d = parse_header_date(header[idx], default_year)
+            if d:
+                date_cols[idx] = d
+
+        if not date_cols:
+            raise ValueError("Не нашёл даты в шапке. Проверь, что в колонках после TT стоят даты (например 20.янв).")
+
+        inserted = updated = skipped = 0
+
+        with engine.begin() as conn:
+            for r in ws.iter_rows(min_row=2, values_only=True):
+                if not r or len(r) < 1:
+                    continue
+
+                point = normalize_point_code(r[0])
+                if not point:
+                    continue
+
+                for col_idx, d in date_cols.items():
+                    if col_idx >= len(r):
+                        continue
+                    val = r[col_idx]
+                    if val is None or str(val).strip() == "":
+                        continue
+
+                    try:
+                        boxes = int(float(val))
+                    except Exception:
+                        skipped += 1
+                        continue
+
+                    has_supply = boxes >= 5
+
+                    res = conn.execute(text("""
+                        INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
+                        VALUES (:p, :d, :b, :hs)
+                        ON CONFLICT (point_code, supply_date) DO UPDATE
+                            SET boxes = EXCLUDED.boxes,
+                                has_supply = EXCLUDED.has_supply
+                        RETURNING xmax;
+                    """), {"p": point, "d": d, "b": boxes, "hs": has_supply})
+
+                    xmax = res.scalar()
+                    if xmax == 0:
+                        inserted += 1
+                    else:
+                        updated += 1
+
+        await state.clear()
+        await message.answer(
+            f"✅ Поставки загружены.\nДобавлено: {inserted}\nОбновлено: {updated}\nПропущено (плохие ячейки): {skipped}",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"❌ Ошибка загрузки поставок: {type(e).__name__}: {e}", reply_markup=ReplyKeyboardRemove())
 
 
 # ----------------- Calendar UI -----------------
@@ -456,7 +781,7 @@ def build_friday_slot_kb(day: int) -> InlineKeyboardMarkup:
 
 
 def build_saturday_slot_kb(day: int) -> InlineKeyboardMarkup:
-    # ВАЖНО: суббота может быть и утро (инвент), и день (поставка/без поставки)
+    # Суббота может быть и утро-инвент, и день (поставка/без поставки)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сб: Утренний (400)", callback_data=f"slot:SAT_MORNING:{day}")],
         [InlineKeyboardButton(text="Сб: Дневной (400/800)", callback_data=f"slot:DAY:{day}")],
@@ -506,11 +831,12 @@ async def render_calendar(message_or_cb, state: FSMContext):
 
 # ----------------- Visits / collisions -----------------
 def add_or_remove_visit(merchant_id: int, point: str, y: int, m: int, day: int, slot: str) -> tuple[bool, bool]:
-    """Returns (exists_before, now_added). If existed -> removed."""
+    """Returns (existed_before, now_added). If existed -> removed."""
     d = date(y, m, day)
     with engine.begin() as conn:
         existing = conn.execute(text("""
-            SELECT id FROM visits WHERE merchant_id=:mid AND point_code=:p AND visit_date=:d AND slot=:s
+            SELECT id FROM visits
+            WHERE merchant_id=:mid AND point_code=:p AND visit_date=:d AND slot=:s
         """), {"mid": merchant_id, "p": point, "d": d, "s": slot}).scalar()
 
         if existing:
@@ -526,7 +852,7 @@ def add_or_remove_visit(merchant_id: int, point: str, y: int, m: int, day: int, 
 
 
 def find_collisions(point: str, y: int, m: int, day: int, merchant_id: int) -> list[dict]:
-    # пересечение считаем по ДНЮ, независимо от slot (как ты и хотел ранее)
+    # пересечение считаем по ДНЮ, независимо от slot
     d = date(y, m, day)
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -596,6 +922,16 @@ async def fill_reconcile_point(message: types.Message, state: FSMContext):
 
     await state.set_state(FillFlow.calendar)
     await state.update_data(point_code=point, cal_y=y, cal_m=m)
+
+    # подсказка если поставок пока нет
+    with engine.connect() as conn:
+        cnt = conn.execute(text("""
+            SELECT COUNT(*) FROM supplies
+            WHERE point_code=:p AND supply_date >= :start AND supply_date < :end
+        """), {"p": point, "start": month_start(y, m), "end": month_end_exclusive(y, m)}).scalar()
+    if cnt == 0:
+        await message.answer("ℹ️ По этой точке в текущем месяце нет поставок в базе (или ещё не загружены). Всё равно можно отмечать выходы.")
+
     await render_calendar(message, state)
 
 
@@ -660,11 +996,13 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     point = data["point_code"]
 
     day = int(cb.data.split(":")[1])
-    if day < 1 or day > days_in_month(y, m):
+    dim = days_in_month(y, m)
+    if day < 1 or day > dim:
         await cb.answer()
         return
 
     wd = weekday_of(y, m, day)
+
     if wd == 4:  # Friday
         await cb.message.edit_text(
             f"Вы выбрали пятницу {day:02d}.{m:02d}. Выберите тип выхода:",
@@ -752,13 +1090,12 @@ async def note_add(cb: types.CallbackQuery, state: FSMContext):
 async def note_amount(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip()
     if txt.lower() == "отмена":
-        # вернуться в календарь
         await state.set_state(FillFlow.calendar)
         await message.answer("Ок, отменил добавление примечания.", reply_markup=ReplyKeyboardRemove())
         await render_calendar(message, state)
         return
 
-    if not re.fullmatch(r"-?\d{1,6}", txt):
+    if not re.fullmatch(r"-?\d{1,7}", txt):
         await message.answer("Нужно целое число. Пример: 350 или -200", reply_markup=CANCEL_KB)
         return
 
@@ -838,10 +1175,11 @@ async def report_cmd(message: types.Message):
     end = month_end_exclusive(y, m)
     mk = start
 
-    # Собираем агрегаты одним запросом:
-    # - DAY с поставкой/без поставки через LEFT JOIN supplies
-    # - инвенты
-    # - reimbursements суммой
+    # Логика отчёта (как ты уточнил):
+    # - количество поставок = количество выходов DAY в дни с has_supply=True
+    # - количество без поставок = количество выходов DAY в дни с has_supply=False
+    # - инвенты = FRI_EVENING + SAT_MORNING
+    # - примечания сумма = reimbursements sum
     with engine.connect() as conn:
         rows = conn.execute(text("""
             WITH v AS (
@@ -888,7 +1226,6 @@ async def report_cmd(message: types.Message):
             ORDER BY a.fio, a.point_code;
         """), {"start": start, "end": end, "mk": mk}).mappings().all()
 
-    # Генерим Excel
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{y}-{m:02d}"
@@ -915,8 +1252,7 @@ async def report_cmd(message: types.Message):
 
         ws.append([fio, point, supply_vis, no_supply_vis, inv, reimb, total])
 
-    # чуть ширины колонок
-    widths = [32, 18, 20, 22, 22, 16, 16]
+    widths = [32, 18, 24, 26, 26, 18, 16]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
@@ -928,7 +1264,7 @@ async def report_cmd(message: types.Message):
     await message.answer_document(BufferedInputFile(out.read(), filename=filename))
 
 
-# ----------------- HTTP server (Render) -----------------
+# ----------------- HTTP server (Render Web Service) -----------------
 async def healthcheck(request):
     return web.Response(text="OK")
 
