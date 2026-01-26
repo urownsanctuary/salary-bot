@@ -2,9 +2,8 @@ import os
 import asyncio
 import hashlib
 import re
-from io import BytesIO, StringIO
+from io import BytesIO
 from datetime import datetime, date, timedelta
-import csv
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -18,9 +17,11 @@ from aiogram.types import (
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-from aiohttp import web
 
 import openpyxl
+
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
 # ----------------- ENV -----------------
@@ -29,8 +30,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", "10000"))
+
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")  # "123,456"
 SECRET_SALT = os.getenv("SECRET_SALT", "CHANGE_ME_SALT")
+
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()  # https://xxx.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()  # /webhook
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()      # any random
+USE_WEBHOOK = bool(WEBHOOK_BASE_URL)  # if base url is set -> webhook
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -84,18 +91,10 @@ def fio_display(s: str) -> str:
 
 
 def fio_norm(s: str) -> str:
-    """
-    Устойчивая нормализация ФИО:
-    - lower
-    - ё->е
-    - unicode-пробелы -> пробел
-    - убрать всё кроме букв и пробелов
-    - схлопнуть пробелы
-    """
     s = (s or "").strip().lower()
     s = s.replace("ё", "е")
-    s = re.sub(r"[\u00A0\u2000-\u200B\u202F\u205F\u3000]", " ", s)  # странные пробелы
-    s = re.sub(r"[^а-яa-z\s]", " ", s)  # убрать знаки/цифры
+    s = re.sub(r"[\u00A0\u2000-\u200B\u202F\u205F\u3000]", " ", s)
+    s = re.sub(r"[^а-яa-z\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -187,14 +186,13 @@ def ensure_tables():
             merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             point_code TEXT NOT NULL,
             month_key DATE NOT NULL, -- 1-е число месяца
-            amount INTEGER NOT NULL, -- может быть отрицательное
+            amount INTEGER NOT NULL,
             note TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS reimb_idx ON reimbursements(merchant_id, point_code, month_key);"))
 
-        # best-effort заполнение fio_norm
         conn.execute(text("""
         UPDATE merchants
         SET fio_norm = lower(replace(replace(fio, 'Ё', 'Е'), 'ё', 'е'))
@@ -231,14 +229,10 @@ def bind_merch_tg_id(merch_id: int, tg_id: int):
 
 
 def upsert_merchant(conn, fio_raw: str, phone_raw: str) -> tuple[bool, bool]:
-    fio_raw = fio_raw or ""
-    phone_raw = phone_raw or ""
+    fio_disp = fio_display(fio_raw or "")
+    fio_n = fio_norm(fio_raw or "")
+    last4 = extract_last4_from_phone(phone_raw or "")
 
-    fio_disp = fio_display(fio_raw)
-    fio_n = fio_norm(fio_raw)
-    last4 = extract_last4_from_phone(phone_raw)
-
-    # минимум "фамилия имя"
     if not fio_n or len(fio_n.split(" ")) < 2 or not re.fullmatch(r"\d{4}", last4):
         return (False, False)
 
@@ -315,7 +309,7 @@ def compute_month_total(merchant_id: int, point_code: str, y: int, m: int) -> in
     return total
 
 
-# ----------------- Excel parsing: supplies (your format) -----------------
+# ----------------- Supplies parsing (your header dates) -----------------
 RU_MONTH = {
     "янв": 1, "январ": 1,
     "фев": 2, "феврал": 2,
@@ -333,14 +327,8 @@ RU_MONTH = {
 
 
 def parse_header_date(cell_value, default_year: int) -> date | None:
-    """
-    В шапке может быть:
-    - datetime/date объект
-    - строка вида '20.янв' / '20 янв' / '20.01' / '20.01.2026'
-    """
     if cell_value is None:
         return None
-
     if isinstance(cell_value, datetime):
         return cell_value.date()
     if isinstance(cell_value, date):
@@ -350,12 +338,10 @@ def parse_header_date(cell_value, default_year: int) -> date | None:
     s = s.replace(",", ".").replace("-", ".")
     s = re.sub(r"\s+", " ", s)
 
-    # 20.янв
     m = re.match(r"^(\d{1,2})[.\s](\D+)$", s)
     if m:
         day = int(m.group(1))
-        mon_raw = m.group(2).strip()
-        mon_raw = re.sub(r"[^а-я]", "", mon_raw)
+        mon_raw = re.sub(r"[^а-я]", "", m.group(2).strip())
         mon = None
         for k, v in RU_MONTH.items():
             if mon_raw.startswith(k):
@@ -364,7 +350,6 @@ def parse_header_date(cell_value, default_year: int) -> date | None:
         if mon:
             return date(default_year, mon, day)
 
-    # 20.01 or 20.1 or 20.01.2026
     m2 = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$", s)
     if m2:
         day = int(m2.group(1))
@@ -415,7 +400,7 @@ async def cancel_or_restart(message: types.Message, state: FSMContext):
         await message.answer("Начнём заново. Напиши /start", reply_markup=ReplyKeyboardRemove())
 
 
-# ----------------- Basic commands -----------------
+# ----------------- Commands -----------------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message, state: FSMContext):
     merch = get_merch_by_tg_id(message.from_user.id)
@@ -460,7 +445,7 @@ async def merchants_count(message: types.Message):
     await message.answer(f"Сейчас мерчендайзеров в базе: {cnt}")
 
 
-# ----------------- Login flow -----------------
+# ----------------- Login -----------------
 async def verify_login_last4(user_tg_id: int, fio_in: str, last4: str) -> tuple[bool, str]:
     merch = get_merch_by_fio(fio_in)
     if not merch:
@@ -478,7 +463,6 @@ async def verify_login_last4(user_tg_id: int, fio_in: str, last4: str) -> tuple[
 
 @dp.message(LoginFlow.waiting_fio)
 async def login_get_fio(message: types.Message, state: FSMContext):
-    # разрешаем ввод "ФИО, 1234"
     txt = (message.text or "").strip()
     prefilled_last4 = None
     if "," in txt:
@@ -529,7 +513,7 @@ async def login_get_last4(message: types.Message, state: FSMContext):
         await message.answer(msg, reply_markup=LOGIN_KB)
 
 
-# ----------------- Admin: upload merchants (.xlsx) -----------------
+# ----------------- Admin upload merchants -----------------
 @dp.message(Command("upload_merchants"))
 async def upload_merchants_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -594,14 +578,13 @@ async def handle_merchants_file(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка обработки файла: {type(e).__name__}: {e}", reply_markup=ReplyKeyboardRemove())
 
 
-# ----------------- Admin: upload supplies (.xlsx your format) -----------------
+# ----------------- Admin upload supplies -----------------
 @dp.message(Command("upload_supplies"))
 async def upload_supplies_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Эта команда только для администратора.")
         return
 
-    # /upload_supplies 2026
     parts = (message.text or "").split()
     y = datetime.utcnow().year
     if len(parts) >= 2 and parts[1].isdigit():
@@ -646,17 +629,12 @@ async def handle_supplies_file(message: types.Message, state: FSMContext):
         wb = openpyxl.load_workbook(BytesIO(raw), read_only=True, data_only=True)
         ws = wb.worksheets[0]
 
-        # header row
         header = None
         for r in ws.iter_rows(min_row=1, max_row=1, values_only=True):
             header = list(r)
         if not header or len(header) < 3:
             raise ValueError("Не смог прочитать шапку: ожидаю TT + (игнор) + даты")
 
-        # предполагаем:
-        # col0 = TT (код точки)
-        # col1 = помощник/ФИО (игнорируем)
-        # col2.. = даты
         date_cols: dict[int, date] = {}
         for idx in range(2, len(header)):
             d = parse_header_date(header[idx], default_year)
@@ -664,7 +642,7 @@ async def handle_supplies_file(message: types.Message, state: FSMContext):
                 date_cols[idx] = d
 
         if not date_cols:
-            raise ValueError("Не нашёл даты в шапке. Проверь, что в колонках после TT стоят даты (например 20.янв).")
+            raise ValueError("Не нашёл даты в шапке. Проверь: после TT должны быть даты (например 20.янв).")
 
         inserted = updated = skipped = 0
 
@@ -721,7 +699,7 @@ async def handle_supplies_file(message: types.Message, state: FSMContext):
 # ----------------- Calendar UI -----------------
 def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int, set[str]]) -> InlineKeyboardMarkup:
     dim = days_in_month(y, m)
-    first_wd = date(y, m, 1).weekday()  # Mon=0
+    first_wd = date(y, m, 1).weekday()
     rows: list[list[InlineKeyboardButton]] = []
 
     wd = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -766,9 +744,7 @@ def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int,
         InlineKeyboardButton(text="◀️ Месяц", callback_data="nav:prev"),
         InlineKeyboardButton(text="Месяц ▶️", callback_data="nav:next"),
     ])
-    rows.append([
-        InlineKeyboardButton(text="🔙 Сменить точку", callback_data="back_point"),
-    ])
+    rows.append([InlineKeyboardButton(text="🔙 Сменить точку", callback_data="back_point")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -781,7 +757,6 @@ def build_friday_slot_kb(day: int) -> InlineKeyboardMarkup:
 
 
 def build_saturday_slot_kb(day: int) -> InlineKeyboardMarkup:
-    # Суббота может быть и утро-инвент, и день (поставка/без поставки)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сб: Утренний (400)", callback_data=f"slot:SAT_MORNING:{day}")],
         [InlineKeyboardButton(text="Сб: Дневной (400/800)", callback_data=f"slot:DAY:{day}")],
@@ -831,7 +806,6 @@ async def render_calendar(message_or_cb, state: FSMContext):
 
 # ----------------- Visits / collisions -----------------
 def add_or_remove_visit(merchant_id: int, point: str, y: int, m: int, day: int, slot: str) -> tuple[bool, bool]:
-    """Returns (existed_before, now_added). If existed -> removed."""
     d = date(y, m, day)
     with engine.begin() as conn:
         existing = conn.execute(text("""
@@ -852,7 +826,6 @@ def add_or_remove_visit(merchant_id: int, point: str, y: int, m: int, day: int, 
 
 
 def find_collisions(point: str, y: int, m: int, day: int, merchant_id: int) -> list[dict]:
-    # пересечение считаем по ДНЮ, независимо от slot
     d = date(y, m, day)
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -922,16 +895,6 @@ async def fill_reconcile_point(message: types.Message, state: FSMContext):
 
     await state.set_state(FillFlow.calendar)
     await state.update_data(point_code=point, cal_y=y, cal_m=m)
-
-    # подсказка если поставок пока нет
-    with engine.connect() as conn:
-        cnt = conn.execute(text("""
-            SELECT COUNT(*) FROM supplies
-            WHERE point_code=:p AND supply_date >= :start AND supply_date < :end
-        """), {"p": point, "start": month_start(y, m), "end": month_end_exclusive(y, m)}).scalar()
-    if cnt == 0:
-        await message.answer("ℹ️ По этой точке в текущем месяце нет поставок в базе (или ещё не загружены). Всё равно можно отмечать выходы.")
-
     await render_calendar(message, state)
 
 
@@ -996,13 +959,11 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     point = data["point_code"]
 
     day = int(cb.data.split(":")[1])
-    dim = days_in_month(y, m)
-    if day < 1 or day > dim:
+    if day < 1 or day > days_in_month(y, m):
         await cb.answer()
         return
 
     wd = weekday_of(y, m, day)
-
     if wd == 4:  # Friday
         await cb.message.edit_text(
             f"Вы выбрали пятницу {day:02d}.{m:02d}. Выберите тип выхода:",
@@ -1024,7 +985,7 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer("Сначала /start")
         return
 
-    existed, added = add_or_remove_visit(merch["id"], point, y, m, day, "DAY")
+    _, added = add_or_remove_visit(merch["id"], point, y, m, day, "DAY")
     if added:
         others = find_collisions(point, y, m, day, merch["id"])
         if others:
@@ -1053,7 +1014,7 @@ async def cal_slot_pick(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer("Сначала /start")
         return
 
-    existed, added = add_or_remove_visit(merch["id"], point, y, m, day, slot)
+    _, added = add_or_remove_visit(merch["id"], point, y, m, day, slot)
     if added:
         others = find_collisions(point, y, m, day, merch["id"])
         if others:
@@ -1068,14 +1029,9 @@ async def slot_cancel(cb: types.CallbackQuery, state: FSMContext):
     await render_calendar(cb, state)
 
 
-# ----------------- Notes / reimbursements -----------------
+# ----------------- Notes -----------------
 @dp.callback_query(F.data == "note:add")
 async def note_add(cb: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "point_code" not in data:
-        await cb.answer()
-        return
-
     await state.set_state(NoteFlow.waiting_amount)
     await cb.message.answer(
         "Введите сумму примечания/возмещения (целое число).\n"
@@ -1113,10 +1069,6 @@ async def note_text(message: types.Message, state: FSMContext):
         await render_calendar(message, state)
         return
 
-    if len(txt) < 2:
-        await message.answer("Комментарий слишком короткий. Напиши пару слов.", reply_markup=CANCEL_KB)
-        return
-
     data = await state.get_data()
     merch = get_merch_by_tg_id(message.from_user.id)
     if not merch:
@@ -1141,7 +1093,7 @@ async def note_text(message: types.Message, state: FSMContext):
     await render_calendar(message, state)
 
 
-# ----------------- REPORT (admin) -----------------
+# ----------------- REPORT -----------------
 def parse_month_arg(s: str) -> tuple[int, int] | None:
     s = (s or "").strip()
     m = re.fullmatch(r"(\d{4})-(\d{2})", s)
@@ -1175,11 +1127,6 @@ async def report_cmd(message: types.Message):
     end = month_end_exclusive(y, m)
     mk = start
 
-    # Логика отчёта (как ты уточнил):
-    # - количество поставок = количество выходов DAY в дни с has_supply=True
-    # - количество без поставок = количество выходов DAY в дни с has_supply=False
-    # - инвенты = FRI_EVENING + SAT_MORNING
-    # - примечания сумма = reimbursements sum
     with engine.connect() as conn:
         rows = conn.execute(text("""
             WITH v AS (
@@ -1229,8 +1176,7 @@ async def report_cmd(message: types.Message):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{y}-{m:02d}"
-
-    headers = [
+    ws.append([
         "ФИО мерчендайзера",
         "Номер точки",
         "Количество поставок (выходы с поставкой)",
@@ -1238,8 +1184,7 @@ async def report_cmd(message: types.Message):
         "Количество инвентов (пт вечер + сб утро)",
         "Примечания сумма",
         "Сумма по точке",
-    ]
-    ws.append(headers)
+    ])
 
     for r in rows:
         fio = r["fio"]
@@ -1249,42 +1194,91 @@ async def report_cmd(message: types.Message):
         inv = int(r["inventory_visits"] or 0)
         reimb = int(r["reimb_sum"] or 0)
         total = supply_vis * 800 + no_supply_vis * 400 + inv * 400 + reimb
-
         ws.append([fio, point, supply_vis, no_supply_vis, inv, reimb, total])
-
-    widths = [32, 18, 24, 26, 26, 18, 16]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
     out = BytesIO()
     wb.save(out)
     out.seek(0)
-
-    filename = f"report_{y}-{m:02d}.xlsx"
-    await message.answer_document(BufferedInputFile(out.read(), filename=filename))
+    await message.answer_document(BufferedInputFile(out.read(), filename=f"report_{y}-{m:02d}.xlsx"))
 
 
-# ----------------- HTTP server (Render Web Service) -----------------
+# ----------------- Web server -----------------
 async def healthcheck(request):
     return web.Response(text="OK")
 
 
-async def start_http_server():
+async def on_startup(app: web.Application):
+    # webhook mode (recommended on Render free)
+    if USE_WEBHOOK:
+        if not WEBHOOK_SECRET:
+            # not fatal, but better to set
+            pass
+        webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
+        await bot.set_webhook(
+            webhook_url,
+            secret_token=WEBHOOK_SECRET or None,
+            drop_pending_updates=True
+        )
+    else:
+        # polling mode
+        await bot.delete_webhook(drop_pending_updates=True)
+
+
+async def on_shutdown(app: web.Application):
+    if USE_WEBHOOK:
+        # optionally keep webhook; but safe to delete on shutdown
+        pass
+
+
+def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", healthcheck)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+
+    # webhook endpoint
+    if USE_WEBHOOK:
+        SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+            secret_token=WEBHOOK_SECRET or None
+        ).register(app, path=WEBHOOK_PATH)
+
+        setup_application(app, dp, bot=bot)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    return app
 
 
 # ----------------- main -----------------
 async def main():
     ensure_tables()
-    await asyncio.gather(
-        dp.start_polling(bot),
-        start_http_server(),
-    )
+
+    if USE_WEBHOOK:
+        # only web server; telegram will POST updates to webhook
+        app = build_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        # keep alive
+        while True:
+            await asyncio.sleep(3600)
+
+    else:
+        # polling mode (works well only on always-on instance)
+        await bot.delete_webhook(drop_pending_updates=True)
+        # run polling + health server
+        async def start_http_server():
+            app = build_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", PORT)
+            await site.start()
+
+        await asyncio.gather(
+            dp.start_polling(bot),
+            start_http_server(),
+        )
 
 
 if __name__ == "__main__":
