@@ -2,8 +2,9 @@ import os
 import re
 import hashlib
 import secrets
+import asyncio
 from io import BytesIO
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -269,7 +270,6 @@ def ensure_tables():
         );
         """))
 
-        # best-effort backfill fio_norm
         conn.execute(text("""
         UPDATE merchants
         SET fio_norm = lower(replace(replace(fio, 'Ё', 'Е'), 'ё', 'е'))
@@ -307,9 +307,6 @@ def unbind_merch_tg_id(tg_id: int) -> bool:
 
 
 def upsert_merchant(conn, fio_raw: str, phone_raw: str, tu: str) -> tuple[bool, bool, bool]:
-    """
-    returns: (inserted, updated, skipped)
-    """
     fio_disp = fio_display(fio_raw or "")
     fio_n = fio_norm(fio_raw or "")
     last4 = extract_last4_from_phone(phone_raw or "")
@@ -479,13 +476,7 @@ def get_reimb_sums(merchant_id: int, point_code: str, y: int, m: int) -> tuple[i
     return int(notes_sum or 0), int(reimb_sum or 0), int(reimb_no_receipt or 0)
 
 
-def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int, int, int]:
-    """
-    returns:
-      total,
-      cnt_supply_day, cnt_no_supply_day, cnt_invent,
-      notes_sum, reimb_sum_total, reimb_no_receipt
-    """
+def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int, int, int, int]:
     supply = get_supply_map(point_code, y, m)
     visits = get_visits_for_month(merchant_id, point_code, y, m)
     rate_supply, rate_no_supply, rate_inv = get_point_rates(point_code, y, m)
@@ -1199,6 +1190,7 @@ def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int,
             row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
         rows.append(row)
 
+    # 👇 ВОТ ТУТ КНОПКА "Примечания / возмещения"
     rows.append([
         InlineKeyboardButton(text=("☕ Кофемашина: ВКЛ" if coffee_on else "☕ Кофемашина: ВЫКЛ"), callback_data="coffee:toggle"),
         InlineKeyboardButton(text="➕ Примечания / возмещения", callback_data="pr:start"),
@@ -1273,7 +1265,6 @@ async def render_calendar(message_or_cb, state: FSMContext):
     point_total, *_ = compute_point_total(merch["id"], point, y, m)
     overall_total, per_point = compute_overall_total(merch["id"], y, m)
 
-    # 4 строки выбранных дней
     days_supply = []
     days_no_supply = []
     fri_e = []
@@ -1294,8 +1285,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"🌅 Суббота утро: {compress_days(sat_m)}"
     )
 
-    sub = get_submission_status(merch["id"], y, m)
-    submitted = bool(sub)
+    submitted = bool(get_submission_status(merch["id"], y, m))
 
     per_point_lines = []
     for p, s in per_point.items():
@@ -1719,7 +1709,6 @@ async def pr_text(message: types.Message, state: FSMContext):
         await render_calendar(message, state)
         return
 
-    # REIMB
     await state.set_state(PRFlow.waiting_receipt)
     await state.update_data(pr_reimb_id=int(rid))
 
@@ -1736,7 +1725,7 @@ async def pr_text(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query(F.data == "pr:receipt:upload")
-async def pr_receipt_upload(cb: types.CallbackQuery, state: FSMContext):
+async def pr_receipt_upload(cb: types.CallbackQuery):
     await cb.message.answer("📎 Пришлите фото чека (как фото или как файл).", reply_markup=CANCEL_KB)
     await cb.answer()
 
@@ -1808,12 +1797,10 @@ async def pr_receipt_document(message: types.Message, state: FSMContext):
 # ================== REPORT (xlsx) ==================
 def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
     mk = month_start(y, m)
-    start = mk
-    end = month_end_exclusive(y, m)
 
     tu = (tu or "").strip().lower()
     tu_filter_sql = ""
-    params = {"mk": mk, "s": start, "e": end}
+    params = {"mk": mk}
     if tu:
         tu_filter_sql = "AND m.tu = :tu"
         params["tu"] = tu
@@ -1849,7 +1836,6 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
         fio = mer["fio"]
         tu_name = mer.get("tu") or ""
 
-        # точки, где есть активность в месяце
         points = get_points_for_month(mid, y, m)
         for p in points:
             point_total, cnt_supply, cnt_nos, cnt_inv, notes_sum, reimb_sum, reimb_no = compute_point_total(mid, p, y, m)
@@ -1866,7 +1852,6 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
                 point_total,
             ])
 
-    # простая авто-ширина
     for col in ws.columns:
         max_len = 0
         col_letter = col[0].column_letter
@@ -1914,16 +1899,17 @@ async def report_cmd(message: types.Message):
 
 
 # ================== Startup / Webhook / Polling ==================
-async def on_startup(bot_: Bot):
+async def on_startup(bot: Bot):
+    # ✅ КРИТИЧНО: именно bot (не bot_), так aiogram 3 корректно инжектит зависимость
     ensure_tables()
     if USE_WEBHOOK:
         url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
-        await bot_.set_webhook(url, secret_token=WEBHOOK_SECRET or None)
+        await bot.set_webhook(url, secret_token=WEBHOOK_SECRET or None)
 
 
-async def on_shutdown(bot_: Bot):
+async def on_shutdown(bot: Bot):
     if USE_WEBHOOK:
-        await bot_.delete_webhook(drop_pending_updates=False)
+        await bot.delete_webhook(drop_pending_updates=False)
 
 
 def build_app() -> web.Application:
@@ -1943,7 +1929,6 @@ async def main():
         await runner.setup()
         site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
         await site.start()
-        # держим процесс
         while True:
             await asyncio.sleep(3600)
     else:
@@ -1951,6 +1936,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-    ensure_tables()
     asyncio.run(main())
