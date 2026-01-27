@@ -156,11 +156,26 @@ def compress_days(days: list[int]) -> str:
     return ", ".join(parts)
 
 
+def parse_bool_cell(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "да", "true", "yes", "y", "есть", "кофе"):
+        return True
+    return False
+
+
 # ================== Defaults ==================
 DEFAULT_RATE_SUPPLY = 800
 DEFAULT_RATE_NO_SUPPLY = 400
 DEFAULT_RATE_INVENTORY = 400
 DEFAULT_RATE_COFFEE = 100  # фикс
+
+
+SLOT_DAY = "DAY"
+SLOT_FULL_INVENT = "FULL_INVENT"   # только ПТ и СБ
 
 
 # ================== DB schema ==================
@@ -200,7 +215,7 @@ def ensure_tables():
             merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             point_code TEXT NOT NULL,
             visit_date DATE NOT NULL,
-            slot TEXT NOT NULL, -- DAY / FRI_EVENING / SAT_MORNING
+            slot TEXT NOT NULL, -- DAY / FULL_INVENT
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(merchant_id, point_code, visit_date, slot)
         );
@@ -226,18 +241,6 @@ def ensure_tables():
         conn.execute(text("CREATE INDEX IF NOT EXISTS reimb_idx ON reimbursements(merchant_id, point_code, month_key);"))
 
         conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS coffee_bonus (
-            id SERIAL PRIMARY KEY,
-            merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-            point_code TEXT NOT NULL,
-            month_key DATE NOT NULL,
-            enabled BOOLEAN NOT NULL DEFAULT FALSE,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(merchant_id, point_code, month_key)
-        );
-        """))
-
-        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS submissions (
             id SERIAL PRIMARY KEY,
             merchant_id INTEGER NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
@@ -256,10 +259,14 @@ def ensure_tables():
             rate_supply INTEGER NOT NULL,
             rate_no_supply INTEGER NOT NULL,
             rate_inventory INTEGER NOT NULL,
+            coffee_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            pay_lt5 BOOLEAN NOT NULL DEFAULT FALSE,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(point_code, month_key)
         );
         """))
+        conn.execute(text("ALTER TABLE point_rates ADD COLUMN IF NOT EXISTS coffee_enabled BOOLEAN NOT NULL DEFAULT FALSE;"))
+        conn.execute(text("ALTER TABLE point_rates ADD COLUMN IF NOT EXISTS pay_lt5 BOOLEAN NOT NULL DEFAULT FALSE;"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS point_rates_month_idx ON point_rates(month_key);"))
 
         conn.execute(text("""
@@ -333,19 +340,32 @@ def upsert_merchant(conn, fio_raw: str, phone_raw: str, tu: str) -> tuple[bool, 
     return False, True, False
 
 
-def get_supply_map(point_code: str, y: int, m: int) -> dict[int, bool]:
+def point_has_any_supply_in_month(point_code: str, y: int, m: int) -> bool:
+    start = month_start(y, m)
+    end = month_end_exclusive(y, m)
+    with engine.connect() as conn:
+        v = conn.execute(text("""
+            SELECT 1
+            FROM supplies
+            WHERE point_code=:p AND supply_date>=:s AND supply_date<:e
+            LIMIT 1
+        """), {"p": point_code, "s": start, "e": end}).scalar()
+    return v is not None
+
+
+def get_supply_boxes_map(point_code: str, y: int, m: int) -> dict[int, int]:
     start = month_start(y, m)
     end = month_end_exclusive(y, m)
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT supply_date, has_supply
+            SELECT supply_date, boxes
             FROM supplies
             WHERE point_code=:p AND supply_date>=:s AND supply_date<:e
         """), {"p": point_code, "s": start, "e": end}).mappings().all()
-    out = {}
+    out: dict[int, int] = {}
     for r in rows:
         d: date = r["supply_date"]
-        out[d.day] = bool(r["has_supply"])
+        out[d.day] = int(r["boxes"])
     return out
 
 
@@ -364,28 +384,6 @@ def get_visits_for_month(merchant_id: int, point_code: str, y: int, m: int) -> d
         d: date = r["visit_date"]
         out.setdefault(d.day, set()).add(str(r["slot"]))
     return out
-
-
-def coffee_enabled(merchant_id: int, point_code: str, y: int, m: int) -> bool:
-    mk = month_start(y, m)
-    with engine.connect() as conn:
-        v = conn.execute(text("""
-            SELECT enabled FROM coffee_bonus
-            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk
-        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
-    return bool(v) if v is not None else False
-
-
-def set_coffee_enabled(merchant_id: int, point_code: str, y: int, m: int, enabled: bool):
-    mk = month_start(y, m)
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO coffee_bonus (merchant_id, point_code, month_key, enabled, updated_at)
-            VALUES (:mid, :p, :mk, :e, NOW())
-            ON CONFLICT (merchant_id, point_code, month_key) DO UPDATE
-              SET enabled=EXCLUDED.enabled,
-                  updated_at=NOW()
-        """), {"mid": merchant_id, "p": point_code, "mk": mk, "e": enabled})
 
 
 def get_submission_status(merchant_id: int, y: int, m: int):
@@ -435,83 +433,116 @@ def get_points_for_month(merchant_id: int, y: int, m: int) -> list[str]:
                 UNION
                 SELECT point_code FROM reimbursements
                 WHERE merchant_id=:mid AND month_key=:mk
-                UNION
-                SELECT point_code FROM coffee_bonus
-                WHERE merchant_id=:mid AND month_key=:mk
             ) t
             ORDER BY point_code
         """), {"mid": merchant_id, "s": start, "e": end, "mk": mk}).all()
     return [r[0] for r in rows if r and r[0]]
 
 
-def get_point_rates(point_code: str, y: int, m: int) -> tuple[int, int, int]:
+def get_point_rates(point_code: str, y: int, m: int) -> tuple[int, int, int, bool, bool]:
     mk = month_start(y, m)
     with engine.connect() as conn:
         row = conn.execute(text("""
-            SELECT rate_supply, rate_no_supply, rate_inventory
+            SELECT rate_supply, rate_no_supply, rate_inventory, coffee_enabled, pay_lt5
             FROM point_rates
             WHERE point_code=:p AND month_key=:mk
         """), {"p": point_code, "mk": mk}).mappings().first()
     if not row:
-        return DEFAULT_RATE_SUPPLY, DEFAULT_RATE_NO_SUPPLY, DEFAULT_RATE_INVENTORY
-    return int(row["rate_supply"]), int(row["rate_no_supply"]), int(row["rate_inventory"])
+        return DEFAULT_RATE_SUPPLY, DEFAULT_RATE_NO_SUPPLY, DEFAULT_RATE_INVENTORY, False, False
+    return (
+        int(row["rate_supply"]),
+        int(row["rate_no_supply"]),
+        int(row["rate_inventory"]),
+        bool(row["coffee_enabled"]),
+        bool(row["pay_lt5"]),
+    )
 
 
-def get_reimb_sums(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int]:
+def get_reimb_aggregates(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int]:
     mk = month_start(y, m)
     with engine.connect() as conn:
         notes_sum = conn.execute(text("""
             SELECT COALESCE(SUM(amount),0) FROM reimbursements
             WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='NOTE'
         """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+
         reimb_sum = conn.execute(text("""
             SELECT COALESCE(SUM(amount),0) FROM reimbursements
             WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='REIMB'
         """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
-        reimb_no_receipt = conn.execute(text("""
-            SELECT COALESCE(SUM(amount),0) FROM reimbursements
+
+        reimb_count = conn.execute(text("""
+            SELECT COUNT(*) FROM reimbursements
+            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='REIMB'
+        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+
+        reimb_missing_receipt = conn.execute(text("""
+            SELECT COUNT(*) FROM reimbursements
             WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk
               AND kind='REIMB' AND receipt_file_id IS NULL
         """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
-    return int(notes_sum or 0), int(reimb_sum or 0), int(reimb_no_receipt or 0)
+
+    return int(notes_sum or 0), int(reimb_sum or 0), int(reimb_count or 0), int(reimb_missing_receipt or 0)
 
 
-def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int, int, int, int]:
-    supply = get_supply_map(point_code, y, m)
+def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
+    # pay_lt5=True => кофесушки: если коробок > 0, то это оплачиваемая поставка
+    if boxes <= 0:
+        return False
+    return True if pay_lt5 else (boxes >= 5)
+
+
+def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int, int, int, int, bool, int, bool]:
+    boxes_map = get_supply_boxes_map(point_code, y, m)
     visits = get_visits_for_month(merchant_id, point_code, y, m)
-    rate_supply, rate_no_supply, rate_inv = get_point_rates(point_code, y, m)
-    notes_sum, reimb_sum, reimb_no_receipt = get_reimb_sums(merchant_id, point_code, y, m)
+    rate_supply, rate_no_supply, rate_inv, coffee_on, pay_lt5 = get_point_rates(point_code, y, m)
+    notes_sum, reimb_sum, reimb_count, reimb_missing_receipt = get_reimb_aggregates(merchant_id, point_code, y, m)
 
     total = 0
     day_cnt = 0
     cnt_supply_day = 0
     cnt_no_supply_day = 0
-    cnt_invent = 0
+    cnt_full_inv = 0
 
     for day, slots in visits.items():
-        for slot in slots:
-            if slot in ("FRI_EVENING", "SAT_MORNING"):
-                cnt_invent += 1
-                total += rate_inv
+        if SLOT_DAY in slots:
+            day_cnt += 1
+            boxes = boxes_map.get(day, 0)
+            if effective_has_supply(boxes, pay_lt5):
+                cnt_supply_day += 1
+                total += rate_supply
             else:
-                day_cnt += 1
-                if supply.get(day, False):
-                    cnt_supply_day += 1
-                    total += rate_supply
-                else:
-                    cnt_no_supply_day += 1
-                    total += rate_no_supply
+                cnt_no_supply_day += 1
+                total += rate_no_supply
 
-    if coffee_enabled(merchant_id, point_code, y, m):
-        total += DEFAULT_RATE_COFFEE * day_cnt
+        if SLOT_FULL_INVENT in slots:
+            cnt_full_inv += 1
+            total += rate_inv
+
+    coffee_sum = 0
+    if coffee_on and day_cnt > 0:
+        coffee_sum = DEFAULT_RATE_COFFEE * day_cnt
+        total += coffee_sum
 
     total += notes_sum + reimb_sum
-    return total, cnt_supply_day, cnt_no_supply_day, cnt_invent, notes_sum, reimb_sum, reimb_no_receipt
+
+    return (
+        total,
+        cnt_supply_day,
+        cnt_no_supply_day,
+        (cnt_supply_day + cnt_no_supply_day),
+        cnt_full_inv,
+        notes_sum,
+        reimb_sum,
+        coffee_on,
+        coffee_sum,
+        (reimb_missing_receipt > 0),
+    )
 
 
 def compute_overall_total(merchant_id: int, y: int, m: int) -> tuple[int, dict[str, int]]:
     points = get_points_for_month(merchant_id, y, m)
-    per_point = {}
+    per_point: dict[str, int] = {}
     total = 0
     for p in points:
         s, *_ = compute_point_total(merchant_id, p, y, m)
@@ -651,8 +682,19 @@ async def maybe_notify_post_submit_change(merchant_id: int, y: int, m: int, acti
 # ================== Cancel/Restart ==================
 @dp.message(F.text.in_({"Отмена", "Заново"}))
 async def cancel_or_restart(message: types.Message, state: FSMContext):
+    # Особый случай: если мерч на этапе обязательного чека — удаляем черновик возмещения
+    if await state.get_state() == PRFlow.waiting_receipt.state and (message.text or "").strip().lower() == "отмена":
+        data = await state.get_data()
+        rid = data.get("pr_reimb_id")
+        if rid:
+            with engine.begin() as conn:
+                conn.execute(text("DELETE FROM reimbursements WHERE id=:id AND kind='REIMB' AND receipt_file_id IS NULL"), {"id": int(rid)})
+        await state.clear()
+        await message.answer("Ок, отменил. Возмещение не сохранено (чек обязателен).", reply_markup=ReplyKeyboardRemove())
+        return
+
     await state.clear()
-    if message.text == "Отмена":
+    if (message.text or "").strip() == "Отмена":
         await message.answer("Ок, отменил. Напиши /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     else:
         await message.answer("Начнём заново. Напиши /start", reply_markup=ReplyKeyboardRemove())
@@ -930,7 +972,7 @@ async def handle_supplies_file(message: types.Message, state: FSMContext):
                     except Exception:
                         skipped += 1
                         continue
-                    has_supply = boxes >= 5
+                    has_supply = boxes >= 5  # базовый флаг, реальное правило может быть pay_lt5 по rates
                     res = conn.execute(text("""
                         INSERT INTO supplies (point_code, supply_date, boxes, has_supply)
                         VALUES (:p, :d, :b, :hs)
@@ -988,7 +1030,9 @@ async def upload_rates_cmd(message: types.Message, state: FSMContext):
         "A: номер точки\n"
         "B: ставка выход с поставкой\n"
         "C: ставка выход без поставки\n"
-        "D: ставка инвент (пт вечер + сб утро)\n",
+        "D: ставка полный инвент\n"
+        "E: кофемашина (да/нет)\n"
+        "F: оплачивать поставку <5 коробок (да/нет) [пусто = нет]\n",
         reply_markup=CANCEL_KB
     )
 
@@ -1032,20 +1076,26 @@ async def handle_rates_file(message: types.Message, state: FSMContext):
                 except Exception:
                     skipped += 1
                     continue
+
+                coffee = parse_bool_cell(r[4]) if len(r) >= 5 else False
+                pay_lt5 = parse_bool_cell(r[5]) if len(r) >= 6 else False  # пусто = False
+
                 if rs <= 0 or rns <= 0 or rinv <= 0:
                     skipped += 1
                     continue
 
                 res = conn.execute(text("""
-                    INSERT INTO point_rates (point_code, month_key, rate_supply, rate_no_supply, rate_inventory, updated_at)
-                    VALUES (:p, :mk, :rs, :rns, :rinv, NOW())
+                    INSERT INTO point_rates (point_code, month_key, rate_supply, rate_no_supply, rate_inventory, coffee_enabled, pay_lt5, updated_at)
+                    VALUES (:p, :mk, :rs, :rns, :rinv, :coffee, :pay_lt5, NOW())
                     ON CONFLICT (point_code, month_key) DO UPDATE
                       SET rate_supply=EXCLUDED.rate_supply,
                           rate_no_supply=EXCLUDED.rate_no_supply,
                           rate_inventory=EXCLUDED.rate_inventory,
+                          coffee_enabled=EXCLUDED.coffee_enabled,
+                          pay_lt5=EXCLUDED.pay_lt5,
                           updated_at=NOW()
                     RETURNING xmax;
-                """), {"p": point, "mk": mk, "rs": rs, "rns": rns, "rinv": rinv})
+                """), {"p": point, "mk": mk, "rs": rs, "rns": rns, "rinv": rinv, "coffee": coffee, "pay_lt5": pay_lt5})
 
                 xmax = res.scalar()
                 inserted += 1 if xmax == 0 else 0
@@ -1085,7 +1135,7 @@ async def reset_data_cmd(message: types.Message, state: FSMContext):
     await state.set_state(ResetFlow.waiting_code)
     await state.update_data(reset_kind="data", reset_code=code)
     await message.answer(
-        "⚠️ Сброс данных сверок (выходы/примечания/возмещения/кофемашина/отправки/ставки).\n"
+        "⚠️ Сброс данных сверок (выходы/примечания/возмещения/отправки/ставки).\n"
         "Мерчендайзеры и поставки останутся.\n\n"
         f"Чтобы подтвердить — отправь код:\n{code}",
         reply_markup=CANCEL_KB
@@ -1134,13 +1184,11 @@ async def reset_confirm(message: types.Message, state: FSMContext):
         if kind == "data":
             conn.execute(text("DELETE FROM visits;"))
             conn.execute(text("DELETE FROM reimbursements;"))
-            conn.execute(text("DELETE FROM coffee_bonus;"))
             conn.execute(text("DELETE FROM submissions;"))
             conn.execute(text("DELETE FROM point_rates;"))
         else:
             conn.execute(text("DELETE FROM visits;"))
             conn.execute(text("DELETE FROM reimbursements;"))
-            conn.execute(text("DELETE FROM coffee_bonus;"))
             conn.execute(text("DELETE FROM submissions;"))
             conn.execute(text("DELETE FROM point_rates;"))
             conn.execute(text("DELETE FROM supplies;"))
@@ -1152,7 +1200,7 @@ async def reset_confirm(message: types.Message, state: FSMContext):
 
 
 # ================== Calendar UI ==================
-def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int, set[str]], coffee_on: bool, submitted: bool) -> InlineKeyboardMarkup:
+def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, visits: dict[int, set[str]], submitted: bool) -> InlineKeyboardMarkup:
     dim = days_in_month(y, m)
     first_wd = date(y, m, 1).weekday()
     rows: list[list[InlineKeyboardButton]] = []
@@ -1165,17 +1213,16 @@ def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int,
         row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
 
     while day <= dim:
-        has = supply.get(day, False)
+        boxes = boxes_map.get(day, 0)
+        has_eff = effective_has_supply(boxes, pay_lt5)
         v = visits.get(day, set())
 
-        marker_supply = "🟩" if has else "⬜"
+        marker_supply = "🟩" if has_eff else "⬜"
         marker_visit = ""
-        if "DAY" in v:
+        if SLOT_DAY in v:
             marker_visit += "✅"
-        if "FRI_EVENING" in v:
-            marker_visit += "🌙"
-        if "SAT_MORNING" in v:
-            marker_visit += "🌅"
+        if SLOT_FULL_INVENT in v:
+            marker_visit += "📦"
 
         text_btn = f"{day:02d}{marker_supply}{marker_visit}"
         row.append(InlineKeyboardButton(text=text_btn, callback_data=f"cal:{day}"))
@@ -1190,11 +1237,6 @@ def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int,
             row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
         rows.append(row)
 
-    # 👇 ВОТ ТУТ КНОПКА "Примечания / возмещения"
-    rows.append([
-        InlineKeyboardButton(text=("☕ Кофемашина: ВКЛ" if coffee_on else "☕ Кофемашина: ВЫКЛ"), callback_data="coffee:toggle"),
-        InlineKeyboardButton(text="➕ Примечания / возмещения", callback_data="pr:start"),
-    ])
     rows.append([
         InlineKeyboardButton(text=("📤 Сверка: отправлена" if submitted else "📤 Отправить сверку"), callback_data=("submit:noop" if submitted else "submit:send")),
         InlineKeyboardButton(text="✅ Готово", callback_data="done"),
@@ -1204,37 +1246,24 @@ def build_calendar_kb(y: int, m: int, supply: dict[int, bool], visits: dict[int,
         InlineKeyboardButton(text="Месяц ▶️", callback_data="nav:next"),
     ])
     rows.append([InlineKeyboardButton(text="📍 Сменить точку", callback_data="back_point")])
+    rows.append([InlineKeyboardButton(text="➕ Примечания / возмещения", callback_data="pr:start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_friday_slot_kb(day: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пт: Дневной", callback_data=f"slot:DAY:{day}")],
-        [InlineKeyboardButton(text="Пт: Вечерний (инвент)", callback_data=f"slot:FRI_EVENING:{day}")],
-        [InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")],
-    ])
-
-
-def build_saturday_slot_kb(day: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Сб: Утренний (инвент)", callback_data=f"slot:SAT_MORNING:{day}")],
-        [InlineKeyboardButton(text="Сб: Дневной", callback_data=f"slot:DAY:{day}")],
-        [InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")],
-    ])
+def build_day_action_kb(day: int, can_full_inv: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="Дневной выход (переключить)", callback_data=f"toggle:{SLOT_DAY}:{day}")],
+    ]
+    if can_full_inv:
+        rows.append([InlineKeyboardButton(text="Полный инвент (переключить)", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
+    rows.append([InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_pr_kind_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Примечание (например: закрытие точки)", callback_data="pr:kind:NOTE")],
-        [InlineKeyboardButton(text="🚕 Возмещение расходов (такси/покупки)", callback_data="pr:kind:REIMB")],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="pr:cancel")],
-    ])
-
-
-def build_receipt_choice_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📎 Загрузить чек", callback_data="pr:receipt:upload")],
-        [InlineKeyboardButton(text="➡️ Отправить без чека", callback_data="pr:receipt:none")],
+        [InlineKeyboardButton(text="📝 Примечание", callback_data="pr:kind:NOTE")],
+        [InlineKeyboardButton(text="🚕 Возмещение расходов (чек обязателен)", callback_data="pr:kind:REIMB")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="pr:cancel")],
     ])
 
@@ -1255,34 +1284,31 @@ async def render_calendar(message_or_cb, state: FSMContext):
             await message_or_cb.answer("Сначала нужно войти: /start", reply_markup=ReplyKeyboardRemove())
         return
 
-    supply = get_supply_map(point, y, m)
+    boxes_map = get_supply_boxes_map(point, y, m)
     visits = get_visits_for_month(merch["id"], point, y, m)
 
-    notes_sum, reimb_sum, reimb_no_receipt = get_reimb_sums(merch["id"], point, y, m)
-    coffee_on = coffee_enabled(merch["id"], point, y, m)
-    rate_supply, rate_no_supply, rate_inv = get_point_rates(point, y, m)
+    rate_supply, rate_no_supply, rate_inv, coffee_on, pay_lt5 = get_point_rates(point, y, m)
+    notes_sum, reimb_sum, reimb_count, reimb_missing_receipt = get_reimb_aggregates(merch["id"], point, y, m)
 
-    point_total, *_ = compute_point_total(merch["id"], point, y, m)
+    point_total, cnt_supply, cnt_nos, cnt_day_total, cnt_full_inv, notes_sum2, reimb_sum2, coffee_on2, coffee_sum, missing_receipts = compute_point_total(merch["id"], point, y, m)
     overall_total, per_point = compute_overall_total(merch["id"], y, m)
 
     days_supply = []
     days_no_supply = []
-    fri_e = []
-    sat_m = []
+    inv_days = []
     for d, slots in visits.items():
-        if "DAY" in slots:
-            (days_supply if supply.get(d, False) else days_no_supply).append(d)
-        if "FRI_EVENING" in slots:
-            fri_e.append(d)
-        if "SAT_MORNING" in slots:
-            sat_m.append(d)
+        if SLOT_DAY in slots:
+            boxes = boxes_map.get(d, 0)
+            (days_supply if effective_has_supply(boxes, pay_lt5) else days_no_supply).append(d)
+        if SLOT_FULL_INVENT in slots:
+            inv_days.append(d)
 
     selected_block = (
         "📋 Выбранные дни:\n"
         f"🟩 Выходы с поставкой: {compress_days(days_supply)}\n"
         f"⬜ Выходы без поставок: {compress_days(days_no_supply)}\n"
-        f"🌙 Пятница вечер: {compress_days(fri_e)}\n"
-        f"🌅 Суббота утро: {compress_days(sat_m)}"
+        f"📦 Полный инвент: {compress_days(inv_days)}\n"
+        f"📌 Дневные выходы всего: {cnt_day_total}"
     )
 
     submitted = bool(get_submission_status(merch["id"], y, m))
@@ -1299,27 +1325,36 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"Ставки на {y}-{m:02d}:\n"
         f"• выход с поставкой: {rate_supply} ₽\n"
         f"• выход без поставки: {rate_no_supply} ₽\n"
-        f"• инвент (пт вечер/сб утро): {rate_inv} ₽\n"
-        f"• ☕ кофемашина (если ВКЛ): +{DEFAULT_RATE_COFFEE} ₽ за каждый дневной выход\n\n"
+        f"• полный инвент: {rate_inv} ₽\n"
+        f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'} (+{DEFAULT_RATE_COFFEE} ₽ за дневной выход)\n"
+        f"• правило поставок: {'оплачивать <5 коробок' if pay_lt5 else 'оплачивать от 5 коробок'}\n\n"
         f"Легенда:\n"
-        f"🟩 есть поставка (≥5) | ⬜ нет поставки\n"
-        f"✅ дневной выход | 🌙 пт вечер | 🌅 сб утро\n\n"
+        f"🟩 оплачиваемая поставка | ⬜ нет/неоплачиваемая поставка\n"
+        f"✅ дневной выход | 📦 полный инвент\n\n"
         f"{selected_block}\n\n"
-        f"☕ Кофемашина: {'ВКЛ' if coffee_on else 'ВЫКЛ'}\n"
+        f"☕ Начислено за кофемашину: {coffee_sum} ₽\n"
         f"📝 Примечания (сумма): {notes_sum} ₽\n"
-        f"🚕 Возмещения (всего): {reimb_sum} ₽  | без чека: {reimb_no_receipt} ₽\n\n"
+        f"🚕 Возмещения (сумма): {reimb_sum} ₽ (шт: {reimb_count})\n\n"
         f"💰 Сумма по этой точке: {point_total} ₽\n"
         f"📊 Общая сумма за месяц (все точки): {overall_total} ₽\n\n"
         f"Суммы по точкам:\n{per_point_text}"
     )
 
-    kb = build_calendar_kb(y, m, supply, visits, coffee_on, submitted)
+    kb = build_calendar_kb(y, m, boxes_map, pay_lt5, visits, submitted)
 
-    if isinstance(message_or_cb, types.CallbackQuery):
-        await message_or_cb.message.edit_text(text_msg, reply_markup=kb)
-        await message_or_cb.answer()
-    else:
-        await message_or_cb.answer(text_msg, reply_markup=kb)
+    try:
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.message.edit_text(text_msg, reply_markup=kb)
+            await message_or_cb.answer()
+        else:
+            await message_or_cb.answer(text_msg, reply_markup=kb)
+    except Exception:
+        # если edit не прошёл — просто отправим новым сообщением
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.message.answer(text_msg, reply_markup=kb)
+            await message_or_cb.answer()
+        else:
+            await message_or_cb.answer(text_msg, reply_markup=kb)
 
 
 # ================== Collisions ==================
@@ -1383,7 +1418,7 @@ async def fill_reconcile_start(message: types.Message, state: FSMContext):
         return
     await state.set_state(FillFlow.waiting_point)
     await message.answer(
-        "Введите номер точки (4–5 цифр).\nПример: 2674\n\nЕсли хотите отменить — нажмите «Отмена».",
+        "Введите номер точки.\nПример: 2674\n\nЕсли хотите отменить — нажмите «Отмена».",
         reply_markup=CANCEL_KB
     )
 
@@ -1402,8 +1437,19 @@ async def fill_reconcile_point(message: types.Message, state: FSMContext):
         return
 
     now = datetime.utcnow().date()
+    y, m = now.year, now.month
+
+    # Проверка: если нет поставок по точке в текущем месяце — не пускаем в календарь
+    if not point_has_any_supply_in_month(point, y, m):
+        await message.answer(
+            f"⚠️ Поставки на этой точке отсутствовали в заполняемом месяце ({y}-{m:02d}).\n"
+            f"Обратитесь к территориальному управляющему.",
+            reply_markup=CANCEL_KB
+        )
+        return
+
     await state.set_state(FillFlow.calendar)
-    await state.update_data(point_code=point, cal_y=now.year, cal_m=now.month)
+    await state.update_data(point_code=point, cal_y=y, cal_m=m)
     await render_calendar(message, state)
 
 
@@ -1415,7 +1461,10 @@ async def noop(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "done")
 async def cal_done(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("✅ Готово. Возвращаю в меню.", reply_markup=None)
+    try:
+        await cb.message.edit_text("✅ Готово. Возвращаю в меню.", reply_markup=None)
+    except Exception:
+        pass
     await cb.message.answer("Главное меню:", reply_markup=MAIN_KB)
     await cb.answer()
 
@@ -1423,8 +1472,11 @@ async def cal_done(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "back_point")
 async def cal_back_point(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(FillFlow.waiting_point)
-    await cb.message.edit_text("Введите номер точки (4–5 цифр). Пример: 2674", reply_markup=None)
-    await cb.message.answer("Введите номер точки (4–5 цифр). Пример: 2674", reply_markup=CANCEL_KB)
+    try:
+        await cb.message.edit_text("Введите номер точки. Пример: 2674", reply_markup=None)
+    except Exception:
+        pass
+    await cb.message.answer("Введите номер точки. Пример: 2674", reply_markup=CANCEL_KB)
     await cb.answer()
 
 
@@ -1440,11 +1492,22 @@ async def cal_nav(cb: types.CallbackQuery, state: FSMContext):
     direction = cb.data.split(":")[1]
 
     if direction == "prev":
-        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        y2, m2 = ((y - 1, 12) if m == 1 else (y, m - 1))
     else:
-        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        y2, m2 = ((y + 1, 1) if m == 12 else (y, m + 1))
 
-    await state.update_data(cal_y=y, cal_m=m)
+    point = data["point_code"]
+
+    # Проверка точки по выбранному месяцу
+    if not point_has_any_supply_in_month(point, y2, m2):
+        await cb.answer("Нет поставок по точке в этом месяце.")
+        await cb.message.answer(
+            f"⚠️ Поставки на этой точке отсутствовали в заполняемом месяце ({y2}-{m2:02d}).\n"
+            f"Обратитесь к территориальному управляющему."
+        )
+        return
+
+    await state.update_data(cal_y=y2, cal_m=m2)
     await render_calendar(cb, state)
 
 
@@ -1465,40 +1528,17 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
         return
 
     wd = weekday_of(y, m, day)
-    if wd == 4:
-        await cb.message.edit_text(
-            f"Вы выбрали пятницу {day:02d}.{m:02d}. Выберите тип выхода:",
-            reply_markup=build_friday_slot_kb(day)
-        )
-        await cb.answer()
-        return
-    if wd == 5:
-        await cb.message.edit_text(
-            f"Вы выбрали субботу {day:02d}.{m:02d}. Выберите тип выхода:",
-            reply_markup=build_saturday_slot_kb(day)
-        )
-        await cb.answer()
-        return
+    can_full_inv = (wd == 4 or wd == 5)  # ПТ или СБ
 
-    merch = get_merch_by_tg_id(cb.from_user.id)
-    if not merch:
-        await cb.answer("Сначала /start")
-        return
-
-    existed, added = add_or_remove_visit(merch["id"], point, y, m, day, "DAY")
-    await maybe_notify_post_submit_change(merch["id"], y, m, f"{'удалил' if existed else 'добавил'} выход DAY {point} {y}-{m:02d}-{day:02d}")
-
-    if added:
-        others = find_collisions(point, y, m, day, merch["id"])
-        if others:
-            await cb.message.answer("⚠️ Внимание: есть пересечение с другим мерчендайзером. Нужна проверка.")
-            await notify_collision(point, y, m, day, merch["fio"], others)
-
-    await render_calendar(cb, state)
+    await cb.message.edit_text(
+        f"{day:02d}.{m:02d} — выберите действие:",
+        reply_markup=build_day_action_kb(day, can_full_inv)
+    )
+    await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("slot:"))
-async def cal_slot_pick(cb: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("toggle:"))
+async def cal_toggle_slot(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if "point_code" not in data:
         await cb.answer()
@@ -1511,13 +1551,22 @@ async def cal_slot_pick(cb: types.CallbackQuery, state: FSMContext):
     _, slot, day_s = cb.data.split(":")
     day = int(day_s)
 
+    if slot == SLOT_FULL_INVENT:
+        wd = weekday_of(y, m, day)
+        if wd not in (4, 5):
+            await cb.answer("Полный инвент доступен только в пятницу и субботу.")
+            return
+
     merch = get_merch_by_tg_id(cb.from_user.id)
     if not merch:
         await cb.answer("Сначала /start")
         return
 
     existed, added = add_or_remove_visit(merch["id"], point, y, m, day, slot)
-    await maybe_notify_post_submit_change(merch["id"], y, m, f"{'удалил' if existed else 'добавил'} выход {slot} {point} {y}-{m:02d}-{day:02d}")
+    await maybe_notify_post_submit_change(
+        merch["id"], y, m,
+        f"{'удалил' if existed else 'добавил'} {slot} {point} {y}-{m:02d}-{day:02d}"
+    )
 
     if added:
         others = find_collisions(point, y, m, day, merch["id"])
@@ -1530,32 +1579,6 @@ async def cal_slot_pick(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "slot_cancel")
 async def slot_cancel(cb: types.CallbackQuery, state: FSMContext):
-    await render_calendar(cb, state)
-
-
-# ================== Coffee toggle ==================
-@dp.callback_query(F.data == "coffee:toggle")
-async def coffee_toggle(cb: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "point_code" not in data:
-        await cb.answer()
-        return
-
-    merch = get_merch_by_tg_id(cb.from_user.id)
-    if not merch:
-        await cb.answer("Сначала /start")
-        return
-
-    y = int(data["cal_y"])
-    m = int(data["cal_m"])
-    point = data["point_code"]
-
-    current = coffee_enabled(merch["id"], point, y, m)
-    new_val = not current
-    set_coffee_enabled(merch["id"], point, y, m, new_val)
-
-    await maybe_notify_post_submit_change(merch["id"], y, m, f"переключил кофемашину ({'ВКЛ' if new_val else 'ВЫКЛ'}) на {point} {y}-{m:02d}")
-    await cb.answer("☕ Ок")
     await render_calendar(cb, state)
 
 
@@ -1603,11 +1626,7 @@ async def submit_send(cb: types.CallbackQuery, state: FSMContext):
 async def pr_start(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(PRFlow.choosing_kind)
     await cb.message.answer(
-        "➕ Примечания / возмещения\n\n"
-        "Выберите тип:\n"
-        "• Примечание — например: закрытие точки\n"
-        "• Возмещение — такси/покупки\n\n"
-        "Комментарий обязателен всегда.",
+        "➕ Примечания / возмещения",
         reply_markup=build_pr_kind_kb()
     )
     await cb.answer()
@@ -1631,18 +1650,12 @@ async def pr_kind(cb: types.CallbackQuery, state: FSMContext):
 
     if kind == "NOTE":
         await cb.message.answer(
-            "📝 Примечание\n\n"
-            "Введите сумму (целое число).\n"
-            "Пример: 1500\n\n"
-            "Далее обязательно напишите комментарий (например: «закрытие точки 2674»).",
+            "Введите сумму (целое число).\nПример: 1500\n\nДалее напишите комментарий.",
             reply_markup=CANCEL_KB
         )
     else:
         await cb.message.answer(
-            "🚕 Возмещение расходов\n\n"
-            "Введите сумму (целое число).\n"
-            "Пример: 350\n\n"
-            "Далее обязательно напишите комментарий (например: «возмещение покупки молока по чеку для кофемашины»).",
+            "Введите сумму возмещения (целое число).\nПример: 350\n\nДалее напишите комментарий.\n\n⚠️ Чек обязателен.",
             reply_markup=CANCEL_KB
         )
     await cb.answer()
@@ -1663,7 +1676,7 @@ async def pr_amount(message: types.Message, state: FSMContext):
 
     await state.update_data(pr_amount=int(txt))
     await state.set_state(PRFlow.waiting_text)
-    await message.answer("Теперь напиши комментарий в свободной форме (обязательно).", reply_markup=CANCEL_KB)
+    await message.answer("Теперь напиши комментарий (обязательно).", reply_markup=CANCEL_KB)
 
 
 @dp.message(PRFlow.waiting_text)
@@ -1701,7 +1714,7 @@ async def pr_text(message: types.Message, state: FSMContext):
             RETURNING id
         """), {"mid": merch["id"], "p": point, "mk": mk, "a": amount, "n": txt, "k": kind}).scalar()
 
-    await maybe_notify_post_submit_change(merch["id"], y, m, f"добавил {'возмещение' if kind=='REIMB' else 'примечание'} {amount} ₽ на {point} {y}-{m:02d}")
+    await maybe_notify_post_submit_change(merch["id"], y, m, f"добавил {('возмещение' if kind=='REIMB' else 'примечание')} {amount} ₽ на {point} {y}-{m:02d}")
 
     if kind == "NOTE":
         await state.set_state(FillFlow.calendar)
@@ -1709,33 +1722,15 @@ async def pr_text(message: types.Message, state: FSMContext):
         await render_calendar(message, state)
         return
 
+    # Возмещение: чек обязателен
     await state.set_state(PRFlow.waiting_receipt)
     await state.update_data(pr_reimb_id=int(rid))
-
     await message.answer(
-        "⚠️ Важно\n"
-        "Для возмещения суммы по чеку обязательно:\n"
-        "1) указать сумму\n"
-        "2) указать комментарий\n"
-        "3) загрузить фото чека по кнопке\n\n"
-        "Если чека нет — можно отправить без чека, но это будет отмечено в отчёте.",
-        reply_markup=ReplyKeyboardRemove()
+        "✅ Возмещение сохранено.\n\n"
+        "⚠️ Теперь обязательно загрузите фото/файл чека.\n"
+        "Без чека возмещение не принимается.",
+        reply_markup=CANCEL_KB
     )
-    await message.answer("Выберите действие:", reply_markup=build_receipt_choice_kb())
-
-
-@dp.callback_query(F.data == "pr:receipt:upload")
-async def pr_receipt_upload(cb: types.CallbackQuery):
-    await cb.message.answer("📎 Пришлите фото чека (как фото или как файл).", reply_markup=CANCEL_KB)
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "pr:receipt:none")
-async def pr_receipt_none(cb: types.CallbackQuery, state: FSMContext):
-    await state.set_state(FillFlow.calendar)
-    await cb.message.answer("✅ Возмещение отправлено без чека (будет пометка в отчёте).", reply_markup=ReplyKeyboardRemove())
-    await cb.answer()
-    await render_calendar(cb, state)
 
 
 async def _save_receipt_and_notify_tu(message: types.Message, state: FSMContext, file_id: str):
@@ -1749,7 +1744,7 @@ async def _save_receipt_and_notify_tu(message: types.Message, state: FSMContext,
         conn.execute(text("""
             UPDATE reimbursements
             SET receipt_file_id=:fid, receipt_uploaded_at=NOW()
-            WHERE id=:id
+            WHERE id=:id AND kind='REIMB'
         """), {"fid": file_id, "id": int(rid)})
 
     merch = get_merch_by_tg_id(message.from_user.id)
@@ -1757,6 +1752,7 @@ async def _save_receipt_and_notify_tu(message: types.Message, state: FSMContext,
     y = int(data.get("cal_y"))
     m = int(data.get("cal_m"))
 
+    # Отправляем чек ТУ в личку
     tu_admin = get_tu_admin_id(merch.get("tu") if merch else "")
     if tu_admin:
         try:
@@ -1768,12 +1764,25 @@ async def _save_receipt_and_notify_tu(message: types.Message, state: FSMContext,
                     f"Мерч: {merch['fio'] if merch else '-'}\n"
                     f"ТУ: {merch.get('tu') or '-'}\n"
                     f"Точка: {point}\n"
-                    f"Месяц: {y}-{m:02d}\n"
-                    f"Сумма/комментарий смотрите в отчёте (/report)."
+                    f"Месяц: {y}-{m:02d}"
                 )
             )
         except Exception:
-            pass
+            # если это не фото (документ), отправим как документ
+            try:
+                await bot.send_document(
+                    tu_admin,
+                    document=file_id,
+                    caption=(
+                        "📎 Чек загружен (возмещение)\n"
+                        f"Мерч: {merch['fio'] if merch else '-'}\n"
+                        f"ТУ: {merch.get('tu') or '-'}\n"
+                        f"Точка: {point}\n"
+                        f"Месяц: {y}-{m:02d}"
+                    )
+                )
+            except Exception:
+                pass
 
 
 @dp.message(PRFlow.waiting_receipt, F.photo)
@@ -1781,7 +1790,7 @@ async def pr_receipt_photo(message: types.Message, state: FSMContext):
     file_id = message.photo[-1].file_id
     await _save_receipt_and_notify_tu(message, state, file_id)
     await state.set_state(FillFlow.calendar)
-    await message.answer("✅ Чек загружен. Возмещение сохранено.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅ Чек загружен. Возмещение принято.", reply_markup=ReplyKeyboardRemove())
     await render_calendar(message, state)
 
 
@@ -1790,7 +1799,7 @@ async def pr_receipt_document(message: types.Message, state: FSMContext):
     file_id = message.document.file_id
     await _save_receipt_and_notify_tu(message, state, file_id)
     await state.set_state(FillFlow.calendar)
-    await message.answer("✅ Чек загружен. Возмещение сохранено.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✅ Чек загружен. Возмещение принято.", reply_markup=ReplyKeyboardRemove())
     await render_calendar(message, state)
 
 
@@ -1800,16 +1809,16 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
 
     tu = (tu or "").strip().lower()
     tu_filter_sql = ""
-    params = {"mk": mk}
+    params = {}
     if tu:
-        tu_filter_sql = "AND m.tu = :tu"
+        tu_filter_sql = "WHERE m.tu = :tu"
         params["tu"] = tu
 
     with engine.connect() as conn:
         merchants = conn.execute(text(f"""
             SELECT m.id, m.fio, m.tu
             FROM merchants m
-            WHERE 1=1 {tu_filter_sql}
+            {tu_filter_sql}
             ORDER BY m.fio
         """), params).mappings().all()
 
@@ -1823,11 +1832,13 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
         "Номер точки",
         "Выходы с поставкой",
         "Выходы без поставок",
-        "Инвенты (пт вечер + сб утро)",
-        "Примечания сумма",
-        "Возмещения всего",
-        "Возмещения без чека",
-        "Сумма по точке",
+        "Дневные выходы всего",
+        "Полный инвент",
+        "Кофемашина (Да/Нет)",
+        "Кофемашина начислено, ₽",
+        "Примечания сумма, ₽",
+        "Возмещения сумма, ₽",
+        "Сумма по точке, ₽",
     ]
     ws.append(headers)
 
@@ -1838,17 +1849,31 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
 
         points = get_points_for_month(mid, y, m)
         for p in points:
-            point_total, cnt_supply, cnt_nos, cnt_inv, notes_sum, reimb_sum, reimb_no = compute_point_total(mid, p, y, m)
+            (
+                point_total,
+                cnt_supply,
+                cnt_nos,
+                cnt_day_total,
+                cnt_full_inv,
+                notes_sum,
+                reimb_sum,
+                coffee_on,
+                coffee_sum,
+                _missing_receipts,
+            ) = compute_point_total(mid, p, y, m)
+
             ws.append([
                 fio,
                 tu_name,
                 p,
                 cnt_supply,
                 cnt_nos,
-                cnt_inv,
+                cnt_day_total,
+                cnt_full_inv,
+                "Да" if coffee_on else "Нет",
+                coffee_sum,
                 notes_sum,
                 reimb_sum,
-                reimb_no,
                 point_total,
             ])
 
@@ -1900,7 +1925,6 @@ async def report_cmd(message: types.Message):
 
 # ================== Startup / Webhook / Polling ==================
 async def on_startup(bot: Bot):
-    # ✅ КРИТИЧНО: именно bot (не bot_), так aiogram 3 корректно инжектит зависимость
     ensure_tables()
     if USE_WEBHOOK:
         url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
