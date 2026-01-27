@@ -1250,9 +1250,11 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_day_action_kb(day: int, can_full_inv: bool) -> InlineKeyboardMarkup:
+def build_day_action_kb(day: int, can_full_inv: bool, day_label: str | None = None) -> InlineKeyboardMarkup:
+    # day_label: "Выход с поставкой" / "Выход без поставки" (только для ПТ/СБ)
+    label = day_label or "Дневной выход (переключить)"
     rows = [
-        [InlineKeyboardButton(text="Дневной выход (переключить)", callback_data=f"toggle:{SLOT_DAY}:{day}")],
+        [InlineKeyboardButton(text=label, callback_data=f"toggle:{SLOT_DAY}:{day}")],
     ]
     if can_full_inv:
         rows.append([InlineKeyboardButton(text="Полный инвент (переключить)", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
@@ -1329,7 +1331,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'} (+{DEFAULT_RATE_COFFEE} ₽ за дневной выход)\n"
         f"• правило поставок: {'оплачивать <5 коробок' if pay_lt5 else 'оплачивать от 5 коробок'}\n\n"
         f"Легенда:\n"
-        f"🟩 оплачиваемая поставка | ⬜ нет/неоплачиваемая поставка\n"
+        f"🟩 выход с поставкой | ⬜ выход без поставки\n"
         f"✅ дневной выход | 📦 полный инвент\n\n"
         f"{selected_block}\n\n"
         f"☕ Начислено за кофемашину: {coffee_sum} ₽\n"
@@ -1511,8 +1513,8 @@ async def cal_nav(cb: types.CallbackQuery, state: FSMContext):
     await render_calendar(cb, state)
 
 
-@dp.callback_query(F.data.startswith("cal:"))
-async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
+# ======= НОВОЕ: общий хелпер для переключения слота (чтобы переиспользовать и для обычных дней) =======
+async def _toggle_slot_and_refresh(cb: types.CallbackQuery, state: FSMContext, slot: str, day: int):
     data = await state.get_data()
     if "point_code" not in data:
         await cb.answer()
@@ -1521,35 +1523,6 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     y = int(data["cal_y"])
     m = int(data["cal_m"])
     point = data["point_code"]
-    day = int(cb.data.split(":")[1])
-
-    if day < 1 or day > days_in_month(y, m):
-        await cb.answer()
-        return
-
-    wd = weekday_of(y, m, day)
-    can_full_inv = (wd == 4 or wd == 5)  # ПТ или СБ
-
-    await cb.message.edit_text(
-        f"{day:02d}.{m:02d} — выберите действие:",
-        reply_markup=build_day_action_kb(day, can_full_inv)
-    )
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("toggle:"))
-async def cal_toggle_slot(cb: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "point_code" not in data:
-        await cb.answer()
-        return
-
-    y = int(data["cal_y"])
-    m = int(data["cal_m"])
-    point = data["point_code"]
-
-    _, slot, day_s = cb.data.split(":")
-    day = int(day_s)
 
     if slot == SLOT_FULL_INVENT:
         wd = weekday_of(y, m, day)
@@ -1575,6 +1548,61 @@ async def cal_toggle_slot(cb: types.CallbackQuery, state: FSMContext):
             await notify_collision(point, y, m, day, merch["fio"], others)
 
     await render_calendar(cb, state)
+
+
+@dp.callback_query(F.data.startswith("cal:"))
+async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
+    """
+    UX:
+    - Пн–Чт и Вс: 1 тап по дню = переключить дневной выход (без меню)
+    - ПТ и СБ: показываем меню (Выход с поставкой/без поставки + Полный инвент + Назад)
+    """
+    data = await state.get_data()
+    if "point_code" not in data:
+        await cb.answer()
+        return
+
+    y = int(data["cal_y"])
+    m = int(data["cal_m"])
+    point = data["point_code"]
+    day = int(cb.data.split(":")[1])
+
+    if day < 1 or day > days_in_month(y, m):
+        await cb.answer()
+        return
+
+    wd = weekday_of(y, m, day)
+    is_fri_sat = (wd == 4 or wd == 5)
+
+    if not is_fri_sat:
+        # Обычный день: сразу переключаем дневной выход
+        await cb.answer("Ок")
+        await _toggle_slot_and_refresh(cb, state, SLOT_DAY, day)
+        return
+
+    # ПТ/СБ: меню выбора
+    _, _, _, _, pay_lt5 = get_point_rates(point, y, m)
+    boxes_map = get_supply_boxes_map(point, y, m)
+    boxes = boxes_map.get(day, 0)
+    has_eff = effective_has_supply(boxes, pay_lt5)
+
+    day_label = "Выход с поставкой (переключить)" if has_eff else "Выход без поставки (переключить)"
+    can_full_inv = True
+
+    await cb.message.edit_text(
+        f"{day:02d}.{m:02d} — выберите действие:",
+        reply_markup=build_day_action_kb(day, can_full_inv, day_label=day_label)
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def cal_toggle_slot(cb: types.CallbackQuery, state: FSMContext):
+    # Оставляем как было, но используем общий хелпер, чтобы логика была в одном месте
+    _, slot, day_s = cb.data.split(":")
+    day = int(day_s)
+    await cb.answer("Ок")
+    await _toggle_slot_and_refresh(cb, state, slot, day)
 
 
 @dp.callback_query(F.data == "slot_cancel")
