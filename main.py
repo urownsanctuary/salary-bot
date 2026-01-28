@@ -1252,12 +1252,12 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
 
 def build_day_action_kb(day: int, can_full_inv: bool, day_label: str | None = None) -> InlineKeyboardMarkup:
     # day_label: "Выход с поставкой" / "Выход без поставки" (только для ПТ/СБ)
-    label = day_label or "Дневной выход (переключить)"
+    label = day_label or "Дневной выход"
     rows = [
         [InlineKeyboardButton(text=label, callback_data=f"toggle:{SLOT_DAY}:{day}")],
     ]
     if can_full_inv:
-        rows.append([InlineKeyboardButton(text="Полный инвент (переключить)", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
+        rows.append([InlineKeyboardButton(text="Полный инвент", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
     rows.append([InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
