@@ -485,6 +485,56 @@ def get_reimb_aggregates(merchant_id: int, point_code: str, y: int, m: int) -> t
     return int(notes_sum or 0), int(reimb_sum or 0), int(reimb_count or 0), int(reimb_missing_receipt or 0)
 
 
+
+
+def get_reimb_comments(merchant_id: int, point_code: str, y: int, m: int) -> tuple[str, str, str]:
+    """
+    Для отчёта.
+
+    Возвращает:
+    - комментарии примечаний (NOTE)
+    - комментарии возмещений (REIMB) + отметка чек/без чека для каждой строки
+    - флаг "Есть возмещения без чека" (Да/Нет)
+    """
+    mk = month_start(y, m)
+    with engine.connect() as conn:
+        notes = conn.execute(text("""
+            SELECT amount, note
+            FROM reimbursements
+            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='NOTE'
+            ORDER BY created_at
+        """), {"mid": merchant_id, "p": point_code, "mk": mk}).mappings().all()
+
+        reimb = conn.execute(text("""
+            SELECT amount, note, receipt_file_id
+            FROM reimbursements
+            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='REIMB'
+            ORDER BY created_at
+        """), {"mid": merchant_id, "p": point_code, "mk": mk}).mappings().all()
+
+    note_parts: list[str] = []
+    for r in notes:
+        amt = int(r["amount"] or 0)
+        txt = (r["note"] or "").strip()
+        note_parts.append(f"{amt} — {txt}" if txt else str(amt))
+
+    reimb_parts: list[str] = []
+    missing = False
+    for r in reimb:
+        amt = int(r["amount"] or 0)
+        txt = (r["note"] or "").strip()
+        has_receipt = bool(r["receipt_file_id"])
+        if not has_receipt:
+            missing = True
+        label = "чек" if has_receipt else "без чека"
+        reimb_parts.append(f"{amt} — {txt} ({label})" if txt else f"{amt} ({label})")
+
+    return (
+        " | ".join(note_parts),
+        " | ".join(reimb_parts),
+        ("Да" if missing else "Нет"),
+    )
+
 def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
     # pay_lt5=True => кофесушки: если коробок > 0, то это оплачиваемая поставка
     if boxes <= 0:
@@ -1250,21 +1300,21 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_day_action_kb(day: int, can_full_inv: bool, day_label: str | None = None) -> InlineKeyboardMarkup:
-    # day_label: "Выход с поставкой" / "Выход без поставки" (только для ПТ/СБ)
-    label = day_label or "Дневной выход"
+def build_day_action_kb(day: int, has_supply_effective: bool, can_full_inv: bool) -> InlineKeyboardMarkup:
+    # Меню действий ТОЛЬКО для ПТ/СБ. Без слова «переключить».
+    exit_text = "Отметить выход с поставкой" if has_supply_effective else "Отметить выход без поставки"
     rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"toggle:{SLOT_DAY}:{day}")],
+        [InlineKeyboardButton(text=exit_text, callback_data=f"toggle:{SLOT_DAY}:{day}")],
     ]
     if can_full_inv:
-        rows.append([InlineKeyboardButton(text="Полный инвент", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
+        rows.append([InlineKeyboardButton(text="Отметить полный инвент", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
     rows.append([InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_pr_kind_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Примечание(например, закрытие точки)", callback_data="pr:kind:NOTE")],
+        [InlineKeyboardButton(text="📝 Примечание", callback_data="pr:kind:NOTE")],
         [InlineKeyboardButton(text="🚕 Возмещение расходов (чек обязателен)", callback_data="pr:kind:REIMB")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="pr:cancel")],
     ])
@@ -1310,7 +1360,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"🟩 Выходы с поставкой: {compress_days(days_supply)}\n"
         f"⬜ Выходы без поставок: {compress_days(days_no_supply)}\n"
         f"📦 Полный инвент: {compress_days(inv_days)}\n"
-        f"📌 Дневные выходы всего: {cnt_day_total}"
+        f"📌 Выходы всего (день): {cnt_day_total}"
     )
 
     submitted = bool(get_submission_status(merch["id"], y, m))
@@ -1585,13 +1635,11 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     boxes_map = get_supply_boxes_map(point, y, m)
     boxes = boxes_map.get(day, 0)
     has_eff = effective_has_supply(boxes, pay_lt5)
-
-    day_label = "Выход с поставкой " if has_eff else "Выход без поставки "
     can_full_inv = True
 
     await cb.message.edit_text(
         f"{day:02d}.{m:02d} — выберите действие:",
-        reply_markup=build_day_action_kb(day, can_full_inv, day_label=day_label)
+        reply_markup=build_day_action_kb(day, has_eff, can_full_inv)
     )
     await cb.answer()
 
@@ -1833,11 +1881,14 @@ async def pr_receipt_document(message: types.Message, state: FSMContext):
 
 # ================== REPORT (xlsx) ==================
 def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
-    mk = month_start(y, m)
+    """Собирает отчёт .xlsx за месяц.
 
+    В отчёте строки формируются по мерчендайзеру и точке (если за месяц по точке есть:
+    выходы / примечания / возмещения).
+    """
     tu = (tu or "").strip().lower()
+    params: dict = {}
     tu_filter_sql = ""
-    params = {}
     if tu:
         tu_filter_sql = "WHERE m.tu = :tu"
         params["tu"] = tu
@@ -1860,19 +1911,22 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
         "Номер точки",
         "Выходы с поставкой",
         "Выходы без поставок",
-        "Дневные выходы всего",
+        "Выходы всего (день)",
         "Полный инвент",
         "Кофемашина (Да/Нет)",
         "Кофемашина начислено, ₽",
         "Примечания сумма, ₽",
+        "Примечания комментарии",
         "Возмещения сумма, ₽",
+        "Возмещения комментарии",
+        "Есть возмещения без чека (Да/Нет)",
         "Сумма по точке, ₽",
     ]
     ws.append(headers)
 
     for mer in merchants:
         mid = int(mer["id"])
-        fio = mer["fio"]
+        fio = mer.get("fio") or ""
         tu_name = mer.get("tu") or ""
 
         points = get_points_for_month(mid, y, m)
@@ -1887,8 +1941,10 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
                 reimb_sum,
                 coffee_on,
                 coffee_sum,
-                _missing_receipts,
+                _missing_receipts_bool,
             ) = compute_point_total(mid, p, y, m)
+
+            note_comments, reimb_comments, missing_receipt_flag = get_reimb_comments(mid, p, y, m)
 
             ws.append([
                 fio,
@@ -1901,22 +1957,29 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
                 "Да" if coffee_on else "Нет",
                 coffee_sum,
                 notes_sum,
+                note_comments,
                 reimb_sum,
+                reimb_comments,
+                missing_receipt_flag,
                 point_total,
             ])
 
+    # Авто-ширина колонок (с ограничением)
     for col in ws.columns:
+        try:
+            col_letter = col[0].column_letter
+        except Exception:
+            continue
         max_len = 0
-        col_letter = col[0].column_letter
         for cell in col:
             v = "" if cell.value is None else str(cell.value)
-            max_len = max(max_len, len(v))
-        ws.column_dimensions[col_letter].width = min(45, max(12, max_len + 2))
+            if len(v) > max_len:
+                max_len = len(v)
+        ws.column_dimensions[col_letter].width = min(55, max(12, max_len + 2))
 
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
-
 
 @dp.message(Command("report"))
 async def report_cmd(message: types.Message):
