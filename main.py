@@ -457,32 +457,54 @@ def get_point_rates(point_code: str, y: int, m: int) -> tuple[int, int, int, boo
         bool(row["pay_lt5"]),
     )
 
+def get_reimb_comments(merchant_id: int, point_code: str, y: int, m: int) -> tuple[str, str, str]:
+    """
+    Для отчёта.
 
-def get_reimb_aggregates(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int]:
+    Возвращает:
+    - комментарии примечаний (NOTE)
+    - комментарии возмещений (REIMB) + отметка чек/без чека для каждой строки
+    - флаг "Есть возмещения без чека" (ДА/НЕТ)
+    """
     mk = month_start(y, m)
     with engine.connect() as conn:
-        notes_sum = conn.execute(text("""
-            SELECT COALESCE(SUM(amount),0) FROM reimbursements
+        notes = conn.execute(text("""
+            SELECT amount, note
+            FROM reimbursements
             WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='NOTE'
-        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+            ORDER BY created_at
+        """), {"mid": merchant_id, "p": point_code, "mk": mk}).mappings().all()
 
-        reimb_sum = conn.execute(text("""
-            SELECT COALESCE(SUM(amount),0) FROM reimbursements
+        reimb = conn.execute(text("""
+            SELECT amount, note, receipt_file_id
+            FROM reimbursements
             WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='REIMB'
-        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+            ORDER BY created_at
+        """), {"mid": merchant_id, "p": point_code, "mk": mk}).mappings().all()
 
-        reimb_count = conn.execute(text("""
-            SELECT COUNT(*) FROM reimbursements
-            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk AND kind='REIMB'
-        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+    note_parts: list[str] = []
+    for r in notes:
+        amt = int(r["amount"] or 0)
+        txt = (r["note"] or "").strip()
+        note_parts.append(f"{amt} — {txt}" if txt else str(amt))
 
-        reimb_missing_receipt = conn.execute(text("""
-            SELECT COUNT(*) FROM reimbursements
-            WHERE merchant_id=:mid AND point_code=:p AND month_key=:mk
-              AND kind='REIMB' AND receipt_file_id IS NULL
-        """), {"mid": merchant_id, "p": point_code, "mk": mk}).scalar()
+    reimb_parts: list[str] = []
+    missing = False
+    for r in reimb:
+        amt = int(r["amount"] or 0)
+        txt = (r["note"] or "").strip()
+        has_receipt = bool(r["receipt_file_id"])
+        if not has_receipt:
+            missing = True
+        label = "чек" if has_receipt else "без чека"
+        reimb_parts.append(f"{amt} — {txt} ({label})" if txt else f"{amt} ({label})")
 
-    return int(notes_sum or 0), int(reimb_sum or 0), int(reimb_count or 0), int(reimb_missing_receipt or 0)
+    return (
+        " | ".join(note_parts),
+        " | ".join(reimb_parts),
+        ("ДА" if missing else "НЕТ"),
+    )
+
 
 
 def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
