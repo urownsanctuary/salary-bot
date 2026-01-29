@@ -1250,21 +1250,21 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_day_action_kb(day: int, can_full_inv: bool, day_label: str | None = None) -> InlineKeyboardMarkup:
-    # day_label: "Выход с поставкой" / "Выход без поставки" (только для ПТ/СБ)
-    label = day_label or "Дневной выход"
+def build_day_action_kb(day: int, has_supply_effective: bool, can_full_inv: bool) -> InlineKeyboardMarkup:
+    # Меню действий ТОЛЬКО для ПТ/СБ. Без слова «переключить».
+    exit_text = "Отметить выход с поставкой" if has_supply_effective else "Отметить выход без поставки"
     rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"toggle:{SLOT_DAY}:{day}")],
+        [InlineKeyboardButton(text=exit_text, callback_data=f"toggle:{SLOT_DAY}:{day}")],
     ]
     if can_full_inv:
-        rows.append([InlineKeyboardButton(text="Полный инвент", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
+        rows.append([InlineKeyboardButton(text="Отметить полный инвент", callback_data=f"toggle:{SLOT_FULL_INVENT}:{day}")])
     rows.append([InlineKeyboardButton(text="↩️ Назад к календарю", callback_data="slot_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_pr_kind_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Примечание(например, закрытие точки)", callback_data="pr:kind:NOTE")],
+        [InlineKeyboardButton(text="📝 Примечание", callback_data="pr:kind:NOTE")],
         [InlineKeyboardButton(text="🚕 Возмещение расходов (чек обязателен)", callback_data="pr:kind:REIMB")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="pr:cancel")],
     ])
@@ -1310,7 +1310,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"🟩 Выходы с поставкой: {compress_days(days_supply)}\n"
         f"⬜ Выходы без поставок: {compress_days(days_no_supply)}\n"
         f"📦 Полный инвент: {compress_days(inv_days)}\n"
-        f"📌 Дневные выходы всего: {cnt_day_total}"
+        f"📌 Выходы всего (день): {cnt_day_total}"
     )
 
     submitted = bool(get_submission_status(merch["id"], y, m))
@@ -1585,13 +1585,11 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     boxes_map = get_supply_boxes_map(point, y, m)
     boxes = boxes_map.get(day, 0)
     has_eff = effective_has_supply(boxes, pay_lt5)
-
-    day_label = "Выход с поставкой " if has_eff else "Выход без поставки "
     can_full_inv = True
 
     await cb.message.edit_text(
         f"{day:02d}.{m:02d} — выберите действие:",
-        reply_markup=build_day_action_kb(day, can_full_inv, day_label=day_label)
+        reply_markup=build_day_action_kb(day, has_eff, can_full_inv)
     )
     await cb.answer()
 
@@ -1837,7 +1835,7 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
 
     tu = (tu or "").strip().lower()
     tu_filter_sql = ""
-    params = {}
+    params: dict = {}
     if tu:
         tu_filter_sql = "WHERE m.tu = :tu"
         params["tu"] = tu
@@ -1860,12 +1858,15 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
         "Номер точки",
         "Выходы с поставкой",
         "Выходы без поставок",
-        "Дневные выходы всего",
+        "Выходы всего (день)",
         "Полный инвент",
         "Кофемашина (Да/Нет)",
         "Кофемашина начислено, ₽",
         "Примечания сумма, ₽",
+        "Примечания комментарии",
         "Возмещения сумма, ₽",
+        "Возмещения комментарии",
+        "Есть возмещения без чека (Да/Нет)",
         "Сумма по точке, ₽",
     ]
     ws.append(headers)
@@ -1887,8 +1888,10 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
                 reimb_sum,
                 coffee_on,
                 coffee_sum,
-                _missing_receipts,
+                missing_receipts,
             ) = compute_point_total(mid, p, y, m)
+
+            note_comments, reimb_comments, missing_receipt_flag = get_reimb_comments(mid, p, y, m)
 
             ws.append([
                 fio,
@@ -1901,17 +1904,21 @@ def build_report_xlsx(y: int, m: int, tu: str | None) -> bytes:
                 "Да" if coffee_on else "Нет",
                 coffee_sum,
                 notes_sum,
+                note_comments,
                 reimb_sum,
+                reimb_comments,
+                missing_receipt_flag,
                 point_total,
             ])
 
+    # авто-ширина колонок
     for col in ws.columns:
         max_len = 0
         col_letter = col[0].column_letter
         for cell in col:
             v = "" if cell.value is None else str(cell.value)
             max_len = max(max_len, len(v))
-        ws.column_dimensions[col_letter].width = min(45, max(12, max_len + 2))
+        ws.column_dimensions[col_letter].width = min(60, max(12, max_len + 2))
 
     bio = BytesIO()
     wb.save(bio)
