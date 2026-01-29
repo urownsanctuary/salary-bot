@@ -1264,7 +1264,7 @@ def build_day_action_kb(day: int, can_full_inv: bool, day_label: str | None = No
 
 def build_pr_kind_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Примечание", callback_data="pr:kind:NOTE")],
+        [InlineKeyboardButton(text="📝 Примечание(например, закрытие точки)", callback_data="pr:kind:NOTE")],
         [InlineKeyboardButton(text="🚕 Возмещение расходов (чек обязателен)", callback_data="pr:kind:REIMB")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="pr:cancel")],
     ])
