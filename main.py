@@ -1332,7 +1332,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"• правило поставок: {'оплачивать <5 коробок' if pay_lt5 else 'оплачивать от 5 коробок'}\n\n"
         f"Легенда:\n"
         f"🟩 выход с поставкой | ⬜ выход без поставки\n"
-        f"✅ дневной выход | 📦 полный инвент\n\n"
+        f"📦 полный инвент\n\n"
         f"{selected_block}\n\n"
         f"☕ Начислено за кофемашину: {coffee_sum} ₽\n"
         f"📝 Примечания (сумма): {notes_sum} ₽\n"
@@ -1586,7 +1586,7 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
     boxes = boxes_map.get(day, 0)
     has_eff = effective_has_supply(boxes, pay_lt5)
 
-    day_label = "Выход с поставкой (переключить)" if has_eff else "Выход без поставки (переключить)"
+    day_label = "Выход с поставкой " if has_eff else "Выход без поставки "
     can_full_inv = True
 
     await cb.message.edit_text(
