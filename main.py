@@ -58,7 +58,10 @@ LOGIN_KB = ReplyKeyboardMarkup(
 )
 
 MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="Заполнить сверку")]],
+    keyboard=[
+        [KeyboardButton(text="Заполнить сверку")],
+        [KeyboardButton(text="💰 Моя сумма за месяц")],
+    ],
     resize_keyboard=True
 )
 
@@ -1335,7 +1338,7 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
         InlineKeyboardButton(text="◀️ Месяц", callback_data="nav:prev"),
         InlineKeyboardButton(text="Месяц ▶️", callback_data="nav:next"),
     ])
-    rows.append([InlineKeyboardButton(text="📊 Сводка по месяцу", callback_data="monthsum")])
+    rows.append([InlineKeyboardButton(text="💰 Моя сумма за месяц", callback_data="monthsum")])
     rows.append([InlineKeyboardButton(text="📍 Сменить точку", callback_data="back_point")])
     rows.append([InlineKeyboardButton(text="➕ Примечания / возмещения", callback_data="pr:start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1533,6 +1536,64 @@ async def fill_reconcile_start(message: types.Message, state: FSMContext):
         "Введите номер точки.\nПример: 2674\n\nЕсли хотите отменить — нажмите «Отмена».",
         reply_markup=CANCEL_KB
     )
+
+@dp.message(F.text == "💰 Моя сумма за месяц")
+async def month_sum_from_menu(message: types.Message, state: FSMContext):
+    merch = get_merch_by_tg_id(message.from_user.id)
+    if not merch:
+        await state.clear()
+        await message.answer("Сначала нужно войти: /start", reply_markup=ReplyKeyboardRemove())
+        return
+
+    # В проекте заполняем "месяц в месяц" — показываем текущий месяц
+    now = datetime.utcnow().date()
+    y, m = now.year, now.month
+
+    submitted_row = get_submission_status(merch["id"], y, m)
+    status_line = "✅ Отправлено" if submitted_row else "🟡 Черновик (не отправлено)"
+
+    points = get_points_for_month(merch["id"], y, m)
+    overall_total, _ = compute_overall_total(merch["id"], y, m)
+
+    lines = [
+        f"💰 Моя сумма за месяц — {month_title(y, m)}",
+        status_line,
+        "",
+        f"💰 Общая сумма: {overall_total} ₽",
+        ""
+    ]
+
+    if not points:
+        lines.append("Пока нет данных по точкам за этот месяц.")
+        await message.answer("\n".join(lines).strip(), reply_markup=MAIN_KB)
+        return
+
+    for p in points:
+        (
+            point_total,
+            cnt_supply,
+            cnt_nos,
+            cnt_day_total,
+            cnt_full_inv,
+            notes_sum,
+            reimb_sum,
+            coffee_on,
+            coffee_sum,
+            missing_receipts,
+        ) = compute_point_total(merch["id"], p, y, m)
+
+        lines.append(f"📍 {p} — {point_total} ₽")
+        lines.append(f"  🟩 с поставкой: {cnt_supply}")
+        lines.append(f"  ⬜ без поставки: {cnt_nos}")
+        lines.append(f"  📌 выходы всего (день): {cnt_day_total}")
+        lines.append(f"  📦 полный инвент: {cnt_full_inv}")
+        if coffee_on:
+            lines.append(f"  ☕ кофемашина: {coffee_sum} ₽")
+        lines.append(f"  📝 примечания: {notes_sum} ₽")
+        lines.append(f"  🚕 возмещения: {reimb_sum} ₽" + (" ⚠️ есть без чека" if missing_receipts else ""))
+        lines.append("")
+
+    await message.answer("\n".join(lines).strip(), reply_markup=MAIN_KB)
 
 
 @dp.message(FillFlow.waiting_point)
@@ -1780,7 +1841,7 @@ async def monthsum(cb: types.CallbackQuery, state: FSMContext):
     overall_total, _ = compute_overall_total(merch["id"], y, m)
 
     lines = [
-        f"📊 Сводка по месяцу — {month_title(y, m)}",
+        f"💰 Моя сумма за месяц — {month_title(y, m)}",
         status_line,
         "",
         f"💰 Общая сумма: {overall_total} ₽",
