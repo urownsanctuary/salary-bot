@@ -267,12 +267,14 @@ def ensure_tables():
             rate_no_supply INTEGER NOT NULL,
             rate_inventory INTEGER NOT NULL,
             coffee_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            coffee_rate INTEGER NOT NULL DEFAULT 100,
             pay_lt5 BOOLEAN NOT NULL DEFAULT FALSE,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(point_code, month_key)
         );
         """))
         conn.execute(text("ALTER TABLE point_rates ADD COLUMN IF NOT EXISTS coffee_enabled BOOLEAN NOT NULL DEFAULT FALSE;"))
+        conn.execute(text("ALTER TABLE point_rates ADD COLUMN IF NOT EXISTS coffee_rate INTEGER NOT NULL DEFAULT 100;"))
         conn.execute(text("ALTER TABLE point_rates ADD COLUMN IF NOT EXISTS pay_lt5 BOOLEAN NOT NULL DEFAULT FALSE;"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS point_rates_month_idx ON point_rates(month_key);"))
 
@@ -449,21 +451,22 @@ def get_points_for_month(merchant_id: int, y: int, m: int) -> list[str]:
     return [r[0] for r in rows if r and r[0]]
 
 
-def get_point_rates(point_code: str, y: int, m: int) -> tuple[int, int, int, bool, bool]:
+def get_point_rates(point_code: str, y: int, m: int) -> tuple[int, int, int, bool, int, bool]:
     mk = month_start(y, m)
     with engine.connect() as conn:
         row = conn.execute(text("""
-            SELECT rate_supply, rate_no_supply, rate_inventory, coffee_enabled, pay_lt5
+            SELECT rate_supply, rate_no_supply, rate_inventory, coffee_enabled, coffee_rate, pay_lt5
             FROM point_rates
             WHERE point_code=:p AND month_key=:mk
         """), {"p": point_code, "mk": mk}).mappings().first()
     if not row:
-        return DEFAULT_RATE_SUPPLY, DEFAULT_RATE_NO_SUPPLY, DEFAULT_RATE_INVENTORY, False, False
+        return DEFAULT_RATE_SUPPLY, DEFAULT_RATE_NO_SUPPLY, DEFAULT_RATE_INVENTORY, False, DEFAULT_RATE_COFFEE, False
     return (
         int(row["rate_supply"]),
         int(row["rate_no_supply"]),
         int(row["rate_inventory"]),
         bool(row["coffee_enabled"]),
+        int(row["coffee_rate"] or DEFAULT_RATE_COFFEE),
         bool(row["pay_lt5"]),
     )
 
@@ -555,7 +558,7 @@ def effective_has_supply(boxes: int, pay_lt5: bool) -> bool:
 def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tuple[int, int, int, int, int, int, int, bool, int, bool]:
     boxes_map = get_supply_boxes_map(point_code, y, m)
     visits = get_visits_for_month(merchant_id, point_code, y, m)
-    rate_supply, rate_no_supply, rate_inv, coffee_on, pay_lt5 = get_point_rates(point_code, y, m)
+    rate_supply, rate_no_supply, rate_inv, coffee_on, coffee_rate, pay_lt5 = get_point_rates(point_code, y, m)
     notes_sum, reimb_sum, reimb_count, reimb_missing_receipt = get_reimb_aggregates(merchant_id, point_code, y, m)
 
     total = 0
@@ -581,7 +584,7 @@ def compute_point_total(merchant_id: int, point_code: str, y: int, m: int) -> tu
 
     coffee_sum = 0
     if coffee_on and day_cnt > 0:
-        coffee_sum = DEFAULT_RATE_COFFEE * day_cnt
+        coffee_sum = int(coffee_rate) * day_cnt
         total += coffee_sum
 
     total += notes_sum + reimb_sum
@@ -720,6 +723,17 @@ def get_tu_admin_id(tu: str) -> int | None:
     return int(v) if v is not None else None
 
 
+
+async def notify_tu_only(tu: str | None, text_msg: str):
+    tu_admin = get_tu_admin_id((tu or "").strip().lower())
+    if not tu_admin:
+        return
+    try:
+        await bot.send_message(int(tu_admin), text_msg)
+    except Exception:
+        pass
+
+
 async def maybe_notify_post_submit_change(merchant_id: int, y: int, m: int, action: str):
     status = get_submission_status(merchant_id, y, m)
     if not status:
@@ -727,12 +741,17 @@ async def maybe_notify_post_submit_change(merchant_id: int, y: int, m: int, acti
     touch_updated_after_submit(merchant_id, y, m)
 
     with engine.connect() as conn:
-        fio = conn.execute(text("SELECT fio FROM merchants WHERE id=:id"), {"id": merchant_id}).scalar()
+        row = conn.execute(text("SELECT fio, tu FROM merchants WHERE id=:id"), {"id": merchant_id}).mappings().first()
+
+    fio = (row.get("fio") if row else None) or "-"
+    tu = (row.get("tu") if row else None) or None
 
     total, _ = compute_overall_total(merchant_id, y, m)
-    await notify_admins(
+    await notify_tu_only(
+        tu,
         "⚠️ Изменения после отправки сверки!\n"
         f"Мерч: {fio}\n"
+        f"ТУ: {tu or '-'}\n"
         f"Месяц: {y}-{m:02d}\n"
         f"Действие: {action}\n"
         f"Текущая общая сумма: {total} ₽"
@@ -1092,7 +1111,8 @@ async def upload_rates_cmd(message: types.Message, state: FSMContext):
         "C: ставка выход без поставки\n"
         "D: ставка полный инвент\n"
         "E: кофемашина (да/нет)\n"
-        "F: оплачивать поставку <5 коробок (да/нет) [пусто = нет]\n",
+        "F: оплачивать поставку <5 коробок (да/нет) [пусто = нет]\n"
+        "G: ставка кофемашины за дневной выход (100 или 200) [пусто = 100]\n",
         reply_markup=CANCEL_KB
     )
 
@@ -1140,22 +1160,32 @@ async def handle_rates_file(message: types.Message, state: FSMContext):
                 coffee = parse_bool_cell(r[4]) if len(r) >= 5 else False
                 pay_lt5 = parse_bool_cell(r[5]) if len(r) >= 6 else False  # пусто = False
 
+                coffee_rate = DEFAULT_RATE_COFFEE
+                if len(r) >= 7 and r[6] is not None and str(r[6]).strip() != "":
+                    try:
+                        coffee_rate = int(float(r[6]))
+                    except Exception:
+                        coffee_rate = DEFAULT_RATE_COFFEE
+                if coffee_rate not in (100, 200):
+                    coffee_rate = DEFAULT_RATE_COFFEE
+
                 if rs <= 0 or rns <= 0 or rinv <= 0:
                     skipped += 1
                     continue
 
                 res = conn.execute(text("""
-                    INSERT INTO point_rates (point_code, month_key, rate_supply, rate_no_supply, rate_inventory, coffee_enabled, pay_lt5, updated_at)
-                    VALUES (:p, :mk, :rs, :rns, :rinv, :coffee, :pay_lt5, NOW())
+                    INSERT INTO point_rates (point_code, month_key, rate_supply, rate_no_supply, rate_inventory, coffee_enabled, coffee_rate, pay_lt5, updated_at)
+                    VALUES (:p, :mk, :rs, :rns, :rinv, :coffee, :coffee_rate, :pay_lt5, NOW())
                     ON CONFLICT (point_code, month_key) DO UPDATE
                       SET rate_supply=EXCLUDED.rate_supply,
                           rate_no_supply=EXCLUDED.rate_no_supply,
                           rate_inventory=EXCLUDED.rate_inventory,
                           coffee_enabled=EXCLUDED.coffee_enabled,
+                          coffee_rate=EXCLUDED.coffee_rate,
                           pay_lt5=EXCLUDED.pay_lt5,
                           updated_at=NOW()
                     RETURNING xmax;
-                """), {"p": point, "mk": mk, "rs": rs, "rns": rns, "rinv": rinv, "coffee": coffee, "pay_lt5": pay_lt5})
+                """), {"p": point, "mk": mk, "rs": rs, "rns": rns, "rinv": rinv, "coffee": coffee, "coffee_rate": coffee_rate, "pay_lt5": pay_lt5})
 
                 xmax = res.scalar()
                 inserted += 1 if xmax == 0 else 0
@@ -1299,12 +1329,13 @@ def build_calendar_kb(y: int, m: int, boxes_map: dict[int, int], pay_lt5: bool, 
 
     rows.append([
         InlineKeyboardButton(text=("📤 Сверка: отправлена" if submitted else "📤 Отправить сверку"), callback_data=("submit:noop" if submitted else "submit:send")),
-        InlineKeyboardButton(text="✅ Готово", callback_data="done"),
+        InlineKeyboardButton(text="⬅️ В меню", callback_data="done"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀️ Месяц", callback_data="nav:prev"),
         InlineKeyboardButton(text="Месяц ▶️", callback_data="nav:next"),
     ])
+    rows.append([InlineKeyboardButton(text="📊 Сводка по месяцу", callback_data="monthsum")])
     rows.append([InlineKeyboardButton(text="📍 Сменить точку", callback_data="back_point")])
     rows.append([InlineKeyboardButton(text="➕ Примечания / возмещения", callback_data="pr:start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1349,7 +1380,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
     boxes_map = get_supply_boxes_map(point, y, m)
     visits = get_visits_for_month(merch["id"], point, y, m)
 
-    rate_supply, rate_no_supply, rate_inv, coffee_on, pay_lt5 = get_point_rates(point, y, m)
+    rate_supply, rate_no_supply, rate_inv, coffee_on, coffee_rate, pay_lt5 = get_point_rates(point, y, m)
     notes_sum, reimb_sum, reimb_count, reimb_missing_receipt = get_reimb_aggregates(merch["id"], point, y, m)
 
     point_total, cnt_supply, cnt_nos, cnt_day_total, cnt_full_inv, notes_sum2, reimb_sum2, coffee_on2, coffee_sum, missing_receipts = compute_point_total(merch["id"], point, y, m)
@@ -1388,7 +1419,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"• выход с поставкой: {rate_supply} ₽\n"
         f"• выход без поставки: {rate_no_supply} ₽\n"
         f"• полный инвент: {rate_inv} ₽\n"
-        f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'} (+{DEFAULT_RATE_COFFEE} ₽ за дневной выход)\n"
+        f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'} (+{coffee_rate} ₽ за дневной выход)\n"
         f"• правило поставок: {'оплачивать <5 коробок' if pay_lt5 else 'оплачивать от 5 коробок'}\n\n"
         f"Легенда:\n"
         f"🟩 выход с поставкой | ⬜ выход без поставки\n"
@@ -1444,7 +1475,7 @@ def find_collisions(point: str, y: int, m: int, day: int, merchant_id: int) -> l
     d = date(y, m, day)
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT DISTINCT v.merchant_id, m.fio, m.telegram_id
+            SELECT DISTINCT v.merchant_id, m.fio, m.telegram_id, m.tu
             FROM visits v
             JOIN merchants m ON m.id=v.merchant_id
             WHERE v.point_code=:p AND v.visit_date=:d AND v.merchant_id<>:mid
@@ -1452,21 +1483,40 @@ def find_collisions(point: str, y: int, m: int, day: int, merchant_id: int) -> l
     return [dict(r) for r in rows]
 
 
-async def notify_collision(point: str, y: int, m: int, day: int, current_fio: str, others: list[dict]):
+
+async def notify_collision(point: str, y: int, m: int, day: int, current_fio: str, current_tu: str | None, others: list[dict]):
     d = date(y, m, day)
-    other_names = ", ".join([o["fio"] for o in others]) if others else "?"
-    await notify_admins(
+    other_names = ", ".join([o.get("fio", "?") for o in others]) if others else "?"
+    msg = (
         "⚠️ Пересечение!\n"
         f"Точка: {point}\n"
         f"Дата: {d.isoformat()}\n"
         f"Новый: {current_fio}\n"
         f"Уже отмечены: {other_names}"
     )
+
+    # Уведомляем только управляющих (ТУ-админов) вовлечённых мерчендайзеров
+    recipients: set[int] = set()
+    tid = get_tu_admin_id(current_tu or "")
+    if tid:
+        recipients.add(int(tid))
+    for o in others:
+        tid2 = get_tu_admin_id(o.get("tu") or "")
+        if tid2:
+            recipients.add(int(tid2))
+
+    for rid in recipients:
+        try:
+            await bot.send_message(rid, msg)
+        except Exception:
+            pass
+
+    # И уведомим мерчей, которые уже были отмечены
     for o in others:
         tg = o.get("telegram_id")
         if tg:
             try:
-                await bot.send_message(int(tg), f"⚠️ Пересечение по точке {point} на {d.isoformat()}. Проверьте с руководителем.")
+                await bot.send_message(int(tg), f"⚠️ Пересечение по точке {point} на {d.isoformat()}. Проверьте с управляющим.")
             except Exception:
                 pass
 
@@ -1605,7 +1655,7 @@ async def _toggle_slot_and_refresh(cb: types.CallbackQuery, state: FSMContext, s
         others = find_collisions(point, y, m, day, merch["id"])
         if others:
             await cb.message.answer("⚠️ Внимание: есть пересечение с другим мерчендайзером. Нужна проверка.")
-            await notify_collision(point, y, m, day, merch["fio"], others)
+            await notify_collision(point, y, m, day, merch["fio"], merch.get("tu"), others)
 
     await render_calendar(cb, state)
 
@@ -1641,7 +1691,7 @@ async def cal_day_click(cb: types.CallbackQuery, state: FSMContext):
         return
 
     # ПТ/СБ: меню выбора
-    _, _, _, _, pay_lt5 = get_point_rates(point, y, m)
+    _, _, _, _, _, pay_lt5 = get_point_rates(point, y, m)
     boxes_map = get_supply_boxes_map(point, y, m)
     boxes = boxes_map.get(day, 0)
     has_eff = effective_has_supply(boxes, pay_lt5)
@@ -1705,6 +1755,71 @@ async def submit_send(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer("Уже отправлено ранее.")
 
     await render_calendar(cb, state)
+
+
+
+@dp.callback_query(F.data == "monthsum")
+async def monthsum(cb: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if "cal_y" not in data:
+        await cb.answer()
+        return
+
+    merch = get_merch_by_tg_id(cb.from_user.id)
+    if not merch:
+        await cb.answer("Сначала /start")
+        return
+
+    y = int(data["cal_y"])
+    m = int(data["cal_m"])
+
+    submitted_row = get_submission_status(merch["id"], y, m)
+    status_line = "✅ Отправлено" if submitted_row else "🟡 Черновик (не отправлено)"
+
+    points = get_points_for_month(merch["id"], y, m)
+    overall_total, _ = compute_overall_total(merch["id"], y, m)
+
+    lines = [
+        f"📊 Сводка по месяцу — {month_title(y, m)}",
+        status_line,
+        "",
+        f"💰 Общая сумма: {overall_total} ₽",
+        ""
+    ]
+
+    if not points:
+        lines.append("Пока нет данных по точкам за этот месяц.")
+        await cb.message.answer("\n".join(lines))
+        await cb.answer()
+        return
+
+    for p in points:
+        (
+            point_total,
+            cnt_supply,
+            cnt_nos,
+            cnt_day_total,
+            cnt_full_inv,
+            notes_sum,
+            reimb_sum,
+            coffee_on,
+            coffee_sum,
+            missing_receipts,
+        ) = compute_point_total(merch["id"], p, y, m)
+
+        lines.append(f"📍 {p} — {point_total} ₽")
+        lines.append(f"  🟩 с поставкой: {cnt_supply}")
+        lines.append(f"  ⬜ без поставки: {cnt_nos}")
+        lines.append(f"  📌 выходы всего (день): {cnt_day_total}")
+        lines.append(f"  📦 полный инвент: {cnt_full_inv}")
+        if coffee_on:
+            lines.append(f"  ☕ кофемашина: {coffee_sum} ₽")
+        lines.append(f"  📝 примечания: {notes_sum} ₽")
+        lines.append(f"  🚕 возмещения: {reimb_sum} ₽" + (" ⚠️ есть без чека" if missing_receipts else ""))
+        lines.append("")
+
+    await cb.message.answer("\n".join(lines).strip())
+    await cb.answer()
 
 
 # ================== Notes / reimbursements ==================
@@ -2022,6 +2137,153 @@ async def report_cmd(message: types.Message):
         BufferedInputFile(xlsx_bytes, filename=fname),
         caption=f"✅ Отчёт за {y}-{m:02d}" + (f" (ТУ: {tu})" if tu else "")
     )
+
+
+
+@dp.message(Command("collisions"))
+async def collisions_cmd(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование:\n/collisions YYYY-MM\n/collisions <ту> YYYY-MM\nПример: /collisions хрупов 2026-01")
+        return
+
+    tu = None
+    ym_str = None
+    if len(parts) == 2:
+        ym_str = parts[1]
+    else:
+        tu = parts[1].strip().lower()
+        ym_str = parts[2]
+
+    ym = parse_month_arg(ym_str)
+    if not ym:
+        await message.answer("Неверный формат месяца. Нужно YYYY-MM, например 2026-01")
+        return
+    y, m = ym
+
+    xlsx_bytes = build_collisions_xlsx(y, m, tu)
+    fname = f"collisions_{tu + '_' if tu else ''}{y}-{m:02d}.xlsx"
+    await message.answer_document(
+        BufferedInputFile(xlsx_bytes, filename=fname),
+        caption=f"✅ Пересечения за {y}-{m:02d}" + (f" (ТУ: {tu})" if tu else "")
+    )
+
+
+def build_collisions_xlsx(y: int, m: int, tu: str | None) -> bytes:
+    """Пересечения за месяц (xlsx): лист Collisions + лист Summary.
+
+    Пересечение = (точка, дата), где отмечено 2+ мерчендайзеров.
+    """
+    tu = (tu or "").strip().lower()
+
+    start = month_start(y, m)
+    end = month_end_exclusive(y, m)
+
+    params = {"s": start, "e": end}
+    tu_filter_sql = ""
+    if tu:
+        tu_filter_sql = "AND m.tu = :tu"
+        params["tu"] = tu
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT v.point_code, v.visit_date, v.slot,
+                   m.id AS merchant_id, m.fio, m.tu, m.telegram_id
+            FROM visits v
+            JOIN merchants m ON m.id = v.merchant_id
+            WHERE v.visit_date >= :s AND v.visit_date < :e
+              {tu_filter_sql}
+            ORDER BY v.point_code, v.visit_date, m.fio
+        """), params).mappings().all()
+
+    # group by (point, date)
+    groups: dict[tuple[str, date], dict] = {}
+    for r in rows:
+        key = (r["point_code"], r["visit_date"])
+        g = groups.setdefault(key, {"people": {}, "slots": set()})
+        mid = int(r["merchant_id"])
+        if mid not in g["people"]:
+            g["people"][mid] = {
+                "fio": r.get("fio") or "",
+                "tu": r.get("tu") or "",
+                "tg": r.get("telegram_id"),
+            }
+        if r.get("slot"):
+            g["slots"].add(str(r["slot"]))
+
+    collisions = []
+    for (point, d), g in groups.items():
+        if len(g["people"]) >= 2:
+            collisions.append((point, d, g))
+
+    # Summary stats
+    point_counts: dict[str, int] = {}
+    tu_counts: dict[str, int] = {}
+    unique_points: set[str] = set()
+    unique_merchants: set[int] = set()
+
+    for point, d, g in collisions:
+        unique_points.add(point)
+        point_counts[point] = point_counts.get(point, 0) + 1
+        for mid, info in g["people"].items():
+            unique_merchants.add(mid)
+            tu_name = (info.get("tu") or "").strip().lower()
+            if tu_name:
+                tu_counts[tu_name] = tu_counts.get(tu_name, 0) + 1
+
+    wb = openpyxl.Workbook()
+
+    ws = wb.active
+    ws.title = "Collisions"
+    ws.append(["Дата", "Точка", "Кол-во мерчей", "ФИО", "ТУ", "Telegram ID", "Слоты"])
+
+    for point, d, g in sorted(collisions, key=lambda x: (x[0], x[1])):
+        people = list(g["people"].values())
+        fios = "; ".join([p["fio"] for p in people])
+        tus = "; ".join(sorted(set([p.get("tu") or "" for p in people if (p.get("tu") or "").strip()])))
+        tgs = "; ".join([str(p["tg"]) for p in people if p.get("tg")])
+        slots = ", ".join(sorted(list(g["slots"])))
+        ws.append([d.isoformat(), point, len(people), fios, tus, tgs, slots])
+
+    ws2 = wb.create_sheet("Summary")
+    ws2.append(["Параметр", "Значение"])
+    ws2.append(["Месяц", f"{y}-{m:02d}"])
+    ws2.append(["Фильтр ТУ", tu or "—"])
+    ws2.append(["Всего пересечений (точка+дата)", len(collisions)])
+    ws2.append(["Уникальных точек с пересечениями", len(unique_points)])
+    ws2.append(["Уникальных мерчендайзеров в пересечениях", len(unique_merchants)])
+
+    # Top points
+    ws2.append([])
+    ws2.append(["Топ точек по пересечениям", "Кол-во"])
+    for p, c in sorted(point_counts.items(), key=lambda kv: kv[1], reverse=True)[:20]:
+        ws2.append([p, c])
+
+    # TU breakdown
+    ws2.append([])
+    ws2.append(["Пересечения по ТУ (участия)", "Кол-во"])
+    for tu_name, c in sorted(tu_counts.items(), key=lambda kv: kv[1], reverse=True):
+        ws2.append([tu_name, c])
+
+    # autosize columns (basic)
+    for wsx in (ws, ws2):
+        for col in wsx.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    max_len = max(max_len, len(str(cell.value)) if cell.value is not None else 0)
+                except Exception:
+                    pass
+            wsx.column_dimensions[col_letter].width = min(60, max(12, max_len + 2))
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
 
 
 # ================== Startup / Webhook / Polling ==================
