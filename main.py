@@ -1422,7 +1422,7 @@ async def render_calendar(message_or_cb, state: FSMContext):
         f"• выход с поставкой: {rate_supply} ₽\n"
         f"• выход без поставки: {rate_no_supply} ₽\n"
         f"• полный инвент: {rate_inv} ₽\n"
-        f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'} (+{coffee_rate} ₽ за дневной выход)\n"
+        f"• кофемашина: {'ДА' if coffee_on else 'НЕТ'}\n"
         f"• правило поставок: {'оплачивать <5 коробок' if pay_lt5 else 'оплачивать от 5 коробок'}\n\n"
         f"Легенда:\n"
         f"🟩 выход с поставкой | ⬜ выход без поставки\n"
