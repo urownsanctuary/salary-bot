@@ -1,16 +1,18 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
+import asyncio
 import os
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import CommandStart
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен из переменных Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 sent_users = set()
 
-@dp.message_handler()
-async def stop_bot(message: types.Message):
+@dp.message()
+async def stop_bot(message: Message):
     if message.from_user.id in sent_users:
         return
 
@@ -24,5 +26,8 @@ async def stop_bot(message: types.Message):
         "Бот больше не используется."
     )
 
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
