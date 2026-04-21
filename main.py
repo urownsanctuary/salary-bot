@@ -19,7 +19,7 @@ async def stop_bot(message: Message):
     sent_users.add(message.from_user.id)
 
     await message.answer(
-        "Коллеги, добрый вечер!\n\n"
+        "Коллеги, добрый день!\n\n"
         "Сверки перенесены на сайт.\n\n"
         "Пожалуйста, используйте новую систему:\n"
         "https://merch-web.onrender.com/login-page\n\n"
